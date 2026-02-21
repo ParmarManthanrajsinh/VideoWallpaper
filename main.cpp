@@ -13,6 +13,7 @@
 #include <propvarutil.h>
 #include <commdlg.h>
 
+#include <cstdint>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -29,270 +30,311 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Named constants
+// ---------------------------------------------------------------------------
+
+/** Undocumented Progman message to spawn a WorkerW behind the desktop icons. */
+static constexpr UINT WM_SPAWN_WORKERW = 0x052C;
+
+/** Pre-seek threshold: begin looping when within 500ms (in 100ns units) of end. */
+static constexpr LONGLONG PreSeekThreshold100ns = 5000000LL;
+
+/** Timer ID for the periodic update tick. */
+static constexpr UINT_PTR TimerIdUpdate = 100;
+
+/** Timer interval in milliseconds. */
+static constexpr UINT TimerIntervalMs = 500;
+
+/** Maximum number of boot retries waiting for desktop. */
+static constexpr int32_t MaxDesktopRetries = 30;
+
+/** Size of class name buffers for GetClassNameW calls. */
+static constexpr int32_t ClassNameBufferSize = 64;
+
+// ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
-namespace { struct MonitorWallpaper; }
+namespace { struct FMonitorWallpaper; }
 static void ShutdownAllMonitors();
 static void ChangeVideo();
 static bool IsAutoStartEnabled();
-static void SetAutoStart(bool enable);
+static void SetAutoStart(bool bEnable);
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 namespace
 {
-    HANDLE g_mutex = nullptr;
-    HWND g_msgWindow = nullptr;         // Hidden message-only window for hotkey
-    bool g_debugEnabled = false;
-    std::ofstream g_logFile;
-    std::wstring g_videoPath;
-    bool g_paused = false;
-    bool g_autoPausedByFullscreen = false;
-    bool g_muted = true;
-    HINSTANCE g_inst = nullptr;
-    const wchar_t* g_wpClass = L"VideoWallpaperClass";
+    HANDLE GMutex = nullptr;
+    HWND GMsgWindow = nullptr;         // Hidden message-only window for hotkey
+    bool GbDebugEnabled = false;
+    std::ofstream GLogFile;
+    std::wstring GVideoPath;
+    bool GbPaused = false;
+    bool GbAutoPausedByFullscreen = false;
+    bool GbMuted = true;
+    HINSTANCE GInstance = nullptr;
+    const wchar_t* GWallpaperClassName = L"VideoWallpaperClass";
 
     // Per-monitor data
-    struct MonitorWallpaper
+    struct FMonitorWallpaper
     {
-        HWND window = nullptr;
-        IMFPMediaPlayer* player = nullptr;
-        RECT rect = {};
-        LONGLONG duration = 0;  // Video duration in 100ns units
+        HWND Window = nullptr;
+        IMFPMediaPlayer* Player = nullptr;
+        RECT Rect = {};
+        LONGLONG Duration = 0;  // Video duration in 100ns units
     };
-    std::vector<MonitorWallpaper> g_monitors;
+    std::vector<FMonitorWallpaper> GMonitors;
 
     // Desktop detection result
-    struct DesktopWindows
+    struct FDesktopWindows
     {
-        HWND progman       = nullptr;
-        HWND shellDefView  = nullptr;
-        HWND workerW       = nullptr;
-        bool shellOnProgman = false;
+        HWND Progman       = nullptr;
+        HWND ShellDefView  = nullptr;
+        HWND WorkerW       = nullptr;
+        bool bShellOnProgman = false;
     };
-    DesktopWindows g_desktop;
+    FDesktopWindows GDesktop;
 
     // ---------------------------------------------------------------------------
     // Logging (only active when debug.flag file exists next to .exe)
     // ---------------------------------------------------------------------------
     std::wstring GetExeDir()
     {
-        wchar_t dir[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, dir, MAX_PATH);
-        PathRemoveFileSpecW(dir);
-        return dir;
+        wchar_t Dir[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, Dir, MAX_PATH);
+        PathRemoveFileSpecW(Dir);
+        return Dir;
     }
 
-    bool IsDebugEnabled()
+    bool IsDebugFlagPresent()
     {
-        std::wstring flagPath = GetExeDir() + L"\\debug.flag";
-        return GetFileAttributesW(flagPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        std::wstring FlagPath = GetExeDir() + L"\\debug.flag";
+        return GetFileAttributesW(FlagPath.c_str()) != INVALID_FILE_ATTRIBUTES;
     }
 
-    void Log(const std::wstring& msg)
+    void Log(const std::wstring& Message)
     {
-        if (!g_debugEnabled) return;
-        if (!g_logFile.is_open())
+        if (!GbDebugEnabled) return;
+        if (!GLogFile.is_open())
         {
-            std::wstring logPath = GetExeDir() + L"\\debug.log";
-            g_logFile.open(logPath.c_str());
+            std::wstring LogPath = GetExeDir() + L"\\debug.log";
+            GLogFile.open(LogPath.c_str());
         }
-        g_logFile << std::string(msg.begin(), msg.end()) << '\n';
-        g_logFile.flush();  // Flush immediately so we can close early if needed
+        // Convert wide string to UTF-8 for proper Unicode support
+        int32_t SizeNeeded = WideCharToMultiByte(CP_UTF8, 0, Message.c_str(),
+                                                  static_cast<int>(Message.size()),
+                                                  nullptr, 0, nullptr, nullptr);
+        if (SizeNeeded > 0)
+        {
+            std::string Utf8(SizeNeeded, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, Message.c_str(),
+                                static_cast<int>(Message.size()),
+                                &Utf8[0], SizeNeeded, nullptr, nullptr);
+            GLogFile << Utf8 << '\n';
+        }
+        GLogFile.flush();  // Flush immediately so we can close early if needed
     }
 
     void CloseLog()
     {
-        if (g_logFile.is_open()) g_logFile.close();
+        if (GLogFile.is_open()) GLogFile.close();
     }
 
     // ---------------------------------------------------------------------------
     // Config
     // ---------------------------------------------------------------------------
-    std::wstring Trim(const std::wstring& s)
+    std::wstring TrimString(const std::wstring& InString)
     {
-        const wchar_t* ws = L" \t\r\n\"";
-        auto a = s.find_first_not_of(ws);
-        if (a == std::wstring::npos) return {};
-        auto b = s.find_last_not_of(ws);
-        return s.substr(a, b - a + 1);
+        const wchar_t* Whitespace = L" \t\r\n\"";
+        auto Start = InString.find_first_not_of(Whitespace);
+        if (Start == std::wstring::npos) return {};
+        auto End = InString.find_last_not_of(Whitespace);
+        return InString.substr(Start, End - Start + 1);
     }
 
     std::wstring ReadVideoPath()
     {
-        std::wstring cfgPath = GetExeDir() + L"\\config.txt";
-        std::wifstream f(cfgPath.c_str());
-        std::wstring p;
-        std::getline(f, p);
-        return Trim(p);
+        std::wstring ConfigPath = GetExeDir() + L"\\config.txt";
+        std::wifstream File(ConfigPath.c_str());
+        std::wstring Path;
+        std::getline(File, Path);
+        return TrimString(Path);
     }
 
     // ---------------------------------------------------------------------------
     // Desktop window detection (Win10 legacy AND Win11 24H2+)
     // ---------------------------------------------------------------------------
-    struct LegacySearch { HWND workerWithShell = nullptr; HWND workerWithout = nullptr; };
-
-    BOOL CALLBACK LegacyEnumProc(HWND hwnd, LPARAM lParam)
+    struct FLegacySearch
     {
-        auto* s = reinterpret_cast<LegacySearch*>(lParam);
-        wchar_t cls[64] = {};
-        GetClassNameW(hwnd, cls, 64);
-        if (lstrcmpW(cls, L"WorkerW") != 0) return TRUE;
-        HWND sv = FindWindowExW(hwnd, nullptr, L"SHELLDLL_DefView", nullptr);
-        if (sv) s->workerWithShell = hwnd;
-        else if (!s->workerWithout) s->workerWithout = hwnd;
+        HWND WorkerWithShell = nullptr;
+        HWND WorkerWithout = nullptr;
+    };
+
+    BOOL CALLBACK LegacyEnumProc(HWND Hwnd, LPARAM LParam)
+    {
+        auto* Search = reinterpret_cast<FLegacySearch*>(LParam);
+        wchar_t ClassName[ClassNameBufferSize] = {};
+        GetClassNameW(Hwnd, ClassName, ClassNameBufferSize);
+        if (lstrcmpW(ClassName, L"WorkerW") != 0) return TRUE;
+        HWND ShellView = FindWindowExW(Hwnd, nullptr, L"SHELLDLL_DefView", nullptr);
+        if (ShellView) Search->WorkerWithShell = Hwnd;
+        else if (!Search->WorkerWithout) Search->WorkerWithout = Hwnd;
         return TRUE;
     }
 
-    struct ProgmanChildren { HWND shellDefView = nullptr; HWND workerW = nullptr; };
-
-    BOOL CALLBACK ProgmanChildProc(HWND hwnd, LPARAM lParam)
+    struct FProgmanChildren
     {
-        auto* s = reinterpret_cast<ProgmanChildren*>(lParam);
-        wchar_t cls[64] = {};
-        GetClassNameW(hwnd, cls, 64);
-        if (lstrcmpW(cls, L"SHELLDLL_DefView") == 0 && !s->shellDefView) s->shellDefView = hwnd;
-        if (lstrcmpW(cls, L"WorkerW") == 0 && !s->workerW) s->workerW = hwnd;
+        HWND ShellDefView = nullptr;
+        HWND WorkerW = nullptr;
+    };
+
+    BOOL CALLBACK ProgmanChildProc(HWND Hwnd, LPARAM LParam)
+    {
+        auto* Children = reinterpret_cast<FProgmanChildren*>(LParam);
+        wchar_t ClassName[ClassNameBufferSize] = {};
+        GetClassNameW(Hwnd, ClassName, ClassNameBufferSize);
+        if (lstrcmpW(ClassName, L"SHELLDLL_DefView") == 0 && !Children->ShellDefView) Children->ShellDefView = Hwnd;
+        if (lstrcmpW(ClassName, L"WorkerW") == 0 && !Children->WorkerW) Children->WorkerW = Hwnd;
         return TRUE;
     }
 
-    DesktopWindows FindDesktopWindows()
+    FDesktopWindows FindDesktopWindows()
     {
-        DesktopWindows dw;
-        dw.progman = FindWindowW(L"Progman", nullptr);
-        if (!dw.progman) { Log(L"ERROR: Progman not found!"); return dw; }
+        FDesktopWindows DesktopWnds;
+        DesktopWnds.Progman = FindWindowW(L"Progman", nullptr);
+        if (!DesktopWnds.Progman) { Log(L"ERROR: Progman not found!"); return DesktopWnds; }
 
-        DWORD_PTR r = 0;
-        SendMessageTimeoutW(dw.progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, &r);
-        Log(L"Sent 0x052C to Progman.");
+        DWORD_PTR Result = 0;
+        SendMessageTimeoutW(DesktopWnds.Progman, WM_SPAWN_WORKERW, 0, 0, SMTO_NORMAL, 1000, &Result);
+        Log(L"Sent WM_SPAWN_WORKERW to Progman.");
 
-        HWND directShell = FindWindowExW(dw.progman, nullptr, L"SHELLDLL_DefView", nullptr);
-        if (directShell)
+        HWND DirectShell = FindWindowExW(DesktopWnds.Progman, nullptr, L"SHELLDLL_DefView", nullptr);
+        if (DirectShell)
         {
             Log(L"Win11 24H2+ mode.");
-            dw.shellDefView = directShell;
-            dw.shellOnProgman = true;
-            ProgmanChildren pc;
-            EnumChildWindows(dw.progman, ProgmanChildProc, reinterpret_cast<LPARAM>(&pc));
-            dw.workerW = pc.workerW;
-            return dw;
+            DesktopWnds.ShellDefView = DirectShell;
+            DesktopWnds.bShellOnProgman = true;
+            FProgmanChildren ProgmanChildren;
+            EnumChildWindows(DesktopWnds.Progman, ProgmanChildProc, reinterpret_cast<LPARAM>(&ProgmanChildren));
+            DesktopWnds.WorkerW = ProgmanChildren.WorkerW;
+            return DesktopWnds;
         }
 
         Log(L"Legacy WorkerW mode.");
-        for (int i = 0; i < 20; ++i)
+        for (int32_t Attempt = 0; Attempt < 20; ++Attempt)
         {
-            LegacySearch ls;
-            EnumWindows(LegacyEnumProc, reinterpret_cast<LPARAM>(&ls));
-            if (ls.workerWithShell && ls.workerWithout)
+            FLegacySearch LegacySearch;
+            EnumWindows(LegacyEnumProc, reinterpret_cast<LPARAM>(&LegacySearch));
+            if (LegacySearch.WorkerWithShell && LegacySearch.WorkerWithout)
             {
-                dw.workerW = ls.workerWithout;
-                dw.shellDefView = FindWindowExW(ls.workerWithShell, nullptr, L"SHELLDLL_DefView", nullptr);
-                return dw;
+                DesktopWnds.WorkerW = LegacySearch.WorkerWithout;
+                DesktopWnds.ShellDefView = FindWindowExW(LegacySearch.WorkerWithShell, nullptr, L"SHELLDLL_DefView", nullptr);
+                return DesktopWnds;
             }
             Sleep(100);
         }
         Log(L"Legacy mode: timeout.");
-        return dw;
+        return DesktopWnds;
     }
 
     // ---------------------------------------------------------------------------
     // Monitor enumeration
     // ---------------------------------------------------------------------------
-    BOOL CALLBACK MonitorEnumProc(HMONITOR, HDC, LPRECT lpRect, LPARAM lParam)
+    BOOL CALLBACK MonitorEnumProc(HMONITOR, HDC, LPRECT InRect, LPARAM LParam)
     {
-        auto* rects = reinterpret_cast<std::vector<RECT>*>(lParam);
-        rects->push_back(*lpRect);
+        auto* Rects = reinterpret_cast<std::vector<RECT>*>(LParam);
+        Rects->push_back(*InRect);
         return TRUE;
     }
 
     std::vector<RECT> EnumerateMonitors()
     {
-        std::vector<RECT> rects;
-        EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&rects));
-        Log(L"Found " + std::to_wstring(rects.size()) + L" monitor(s).");
-        for (size_t i = 0; i < rects.size(); ++i)
+        std::vector<RECT> Rects;
+        EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&Rects));
+        Log(L"Found " + std::to_wstring(Rects.size()) + L" monitor(s).");
+        for (size_t Index = 0; Index < Rects.size(); ++Index)
         {
-            auto& r = rects[i];
-            Log(L"  Monitor " + std::to_wstring(i) + L": "
-                + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top)
-                + L" at (" + std::to_wstring(r.left) + L"," + std::to_wstring(r.top) + L")");
+            auto& MonRect = Rects[Index];
+            Log(L"  Monitor " + std::to_wstring(Index) + L": "
+                + std::to_wstring(MonRect.right - MonRect.left) + L"x" + std::to_wstring(MonRect.bottom - MonRect.top)
+                + L" at (" + std::to_wstring(MonRect.left) + L"," + std::to_wstring(MonRect.top) + L")");
         }
-        return rects;
+        return Rects;
     }
 
     // ---------------------------------------------------------------------------
-    // MFPlay callback — finds its player in g_monitors by HWND
+    // MFPlay callback — finds its player in GMonitors by HWND
     // ---------------------------------------------------------------------------
-    class MediaPlayerCallback final : public IMFPMediaPlayerCallback
+    class FMediaPlayerCallback final : public IMFPMediaPlayerCallback
     {
     public:
-        explicit MediaPlayerCallback(int monitorIndex) : monIdx_(monitorIndex) {}
+        explicit FMediaPlayerCallback(int32_t InMonitorIndex) : MonitorIndex(InMonitorIndex) {}
 
-        STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+        STDMETHODIMP QueryInterface(REFIID Riid, void** OutPv) override
         {
-            if (!ppv) return E_POINTER;
-            if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFPMediaPlayerCallback))
+            if (!OutPv) return E_POINTER;
+            if (Riid == __uuidof(IUnknown) || Riid == __uuidof(IMFPMediaPlayerCallback))
             {
-                *ppv = static_cast<IMFPMediaPlayerCallback*>(this);
+                *OutPv = static_cast<IMFPMediaPlayerCallback*>(this);
                 AddRef(); return S_OK;
             }
-            *ppv = nullptr; return E_NOINTERFACE;
+            *OutPv = nullptr; return E_NOINTERFACE;
         }
-        STDMETHODIMP_(ULONG) AddRef()  override { return InterlockedIncrement(&rc_); }
+        STDMETHODIMP_(ULONG) AddRef()  override { return InterlockedIncrement(&RefCount); }
         STDMETHODIMP_(ULONG) Release() override
         {
-            ULONG c = InterlockedDecrement(&rc_);
-            if (!c) delete this;
-            return c;
+            ULONG Count = InterlockedDecrement(&RefCount);
+            if (!Count) delete this;
+            return Count;
         }
 
-        void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* hdr) override
+        void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* Header) override
         {
-            if (!hdr) return;
-            if (monIdx_ < 0 || monIdx_ >= static_cast<int>(g_monitors.size())) return;
-            auto* player = g_monitors[monIdx_].player;
-            if (!player) return;
+            if (!Header) return;
+            if (MonitorIndex < 0 || MonitorIndex >= static_cast<int32_t>(GMonitors.size())) return;
+            auto* Player = GMonitors[MonitorIndex].Player;
+            if (!Player) return;
 
-            switch (hdr->eEventType)
+            switch (Header->eEventType)
             {
             case MFP_EVENT_TYPE_MEDIAITEM_SET:
             {
-                Log(L"Monitor " + std::to_wstring(monIdx_) + L": Playing.");
+                Log(L"Monitor " + std::to_wstring(MonitorIndex) + L": Playing.");
                 // Capture duration for seamless looping
-                auto* evt = reinterpret_cast<MFP_MEDIAITEM_SET_EVENT*>(hdr);
-                if (evt->pMediaItem)
+                auto* Event = reinterpret_cast<MFP_MEDIAITEM_SET_EVENT*>(Header);
+                if (Event->pMediaItem)
                 {
-                    PROPVARIANT dur; PropVariantInit(&dur);
-                    if (SUCCEEDED(evt->pMediaItem->GetDuration(MFP_POSITIONTYPE_100NS, &dur)))
-                        g_monitors[monIdx_].duration = dur.hVal.QuadPart;
-                    PropVariantClear(&dur);
+                    PROPVARIANT DurationVar; PropVariantInit(&DurationVar);
+                    if (SUCCEEDED(Event->pMediaItem->GetDuration(MFP_POSITIONTYPE_100NS, &DurationVar)))
+                        GMonitors[MonitorIndex].Duration = DurationVar.hVal.QuadPart;
+                    PropVariantClear(&DurationVar);
                 }
-                player->Play();
-                player->UpdateVideo();
+                Player->Play();
+                Player->UpdateVideo();
                 break;
             }
             case MFP_EVENT_TYPE_PLAYBACK_ENDED:
-                Log(L"Monitor " + std::to_wstring(monIdx_) + L": Looping.");
+                Log(L"Monitor " + std::to_wstring(MonitorIndex) + L": Looping.");
                 {
-                    PROPVARIANT pos; PropVariantInit(&pos);
-                    pos.vt = VT_I8; pos.hVal.QuadPart = 0;
-                    player->SetPosition(MFP_POSITIONTYPE_100NS, &pos);
-                    PropVariantClear(&pos);
-                    player->Play();
+                    PROPVARIANT Position; PropVariantInit(&Position);
+                    Position.vt = VT_I8; Position.hVal.QuadPart = 0;
+                    Player->SetPosition(MFP_POSITIONTYPE_100NS, &Position);
+                    PropVariantClear(&Position);
+                    Player->Play();
                 }
                 break;
             default: break;
             }
 
-            if (FAILED(hdr->hrEvent))
-                Log(L"Monitor " + std::to_wstring(monIdx_) + L" MFP Error: "
-                    + std::to_wstring(static_cast<long>(hdr->hrEvent)));
+            if (FAILED(Header->hrEvent))
+                Log(L"Monitor " + std::to_wstring(MonitorIndex) + L" MFP Error: "
+                    + std::to_wstring(static_cast<long>(Header->hrEvent)));
         }
     private:
-        ~MediaPlayerCallback() = default;
-        long rc_ = 1;
-        int monIdx_ = 0;
+        ~FMediaPlayerCallback() = default;
+        long RefCount = 1;
+        int32_t MonitorIndex = 0;
     };
 }
 
@@ -301,65 +343,65 @@ namespace
 // ---------------------------------------------------------------------------
 static bool IsDesktopOccluded()
 {
-    HWND fg = GetForegroundWindow();
-    if (!fg) return false;
+    HWND ForegroundWnd = GetForegroundWindow();
+    if (!ForegroundWnd) return false;
 
     // Don't pause for desktop / shell windows
-    wchar_t cls[64] = {};
-    GetClassNameW(fg, cls, 64);
-    if (lstrcmpW(cls, L"Progman") == 0 ||
-        lstrcmpW(cls, L"WorkerW") == 0 ||
-        lstrcmpW(cls, L"Shell_TrayWnd") == 0 ||
-        lstrcmpW(cls, L"Shell_SecondaryTrayWnd") == 0)
+    wchar_t ClassName[ClassNameBufferSize] = {};
+    GetClassNameW(ForegroundWnd, ClassName, ClassNameBufferSize);
+    if (lstrcmpW(ClassName, L"Progman") == 0 ||
+        lstrcmpW(ClassName, L"WorkerW") == 0 ||
+        lstrcmpW(ClassName, L"Shell_TrayWnd") == 0 ||
+        lstrcmpW(ClassName, L"Shell_SecondaryTrayWnd") == 0)
         return false;
 
-    RECT fgRect;
-    GetWindowRect(fg, &fgRect);
+    RECT ForegroundRect;
+    GetWindowRect(ForegroundWnd, &ForegroundRect);
 
     // Maximized window covers the full work area
-    if (IsZoomed(fg))
+    if (IsZoomed(ForegroundWnd))
         return true;
 
     // Check for borderless fullscreen (games, video players)
-    LONG style = GetWindowLongW(fg, GWL_STYLE);
-    bool noBorder = !(style & WS_CAPTION) || !(style & WS_THICKFRAME);
-    if (!noBorder) return false;
+    LONG_PTR Style = GetWindowLongPtrW(ForegroundWnd, GWL_STYLE);
+    bool bNoBorder = !(Style & WS_CAPTION) || !(Style & WS_THICKFRAME);
+    if (!bNoBorder) return false;
 
     // Check if it covers at least one monitor fully
-    HMONITOR hMon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = { sizeof(mi) };
-    GetMonitorInfoW(hMon, &mi);
+    HMONITOR Monitor = MonitorFromWindow(ForegroundWnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO MonitorInfo = { sizeof(MonitorInfo) };
+    GetMonitorInfoW(Monitor, &MonitorInfo);
 
-    return (fgRect.left   <= mi.rcMonitor.left &&
-            fgRect.top    <= mi.rcMonitor.top &&
-            fgRect.right  >= mi.rcMonitor.right &&
-            fgRect.bottom >= mi.rcMonitor.bottom);
+    return (ForegroundRect.left   <= MonitorInfo.rcMonitor.left &&
+            ForegroundRect.top    <= MonitorInfo.rcMonitor.top &&
+            ForegroundRect.right  >= MonitorInfo.rcMonitor.right &&
+            ForegroundRect.bottom >= MonitorInfo.rcMonitor.bottom);
 }
 
 // ---------------------------------------------------------------------------
 // Wallpaper window procedure (per-monitor windows)
 // ---------------------------------------------------------------------------
-LRESULT CALLBACK WpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+LRESULT CALLBACK WallpaperWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LParam)
 {
-    switch (msg)
+    switch (Msg)
     {
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:
     {
-        PAINTSTRUCT ps;
-        BeginPaint(hwnd, &ps);
-        EndPaint(hwnd, &ps);
-        for (auto& m : g_monitors)
-            if (m.window == hwnd && m.player) m.player->UpdateVideo();
+        PAINTSTRUCT PaintStruct;
+        BeginPaint(Hwnd, &PaintStruct);
+        EndPaint(Hwnd, &PaintStruct);
+        for (auto& Monitor : GMonitors)
+            if (Monitor.Window == Hwnd && Monitor.Player) Monitor.Player->UpdateVideo();
         return 0;
     }
     case WM_SIZE:
-        for (auto& m : g_monitors)
-            if (m.window == hwnd && m.player) m.player->UpdateVideo();
+        for (auto& Monitor : GMonitors)
+            if (Monitor.Window == Hwnd && Monitor.Player) Monitor.Player->UpdateVideo();
         return 0;
     }
-    return DefWindowProcW(hwnd, msg, wp, lp);
+    return DefWindowProcW(Hwnd, Msg, WParam, LParam);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,84 +416,84 @@ LRESULT CALLBACK WpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 namespace
 {
-    NOTIFYICONDATAW g_nid = {};
+    NOTIFYICONDATAW GTrayIconData = {};
 
-    void AddTrayIcon(HWND hwnd)
+    void AddTrayIcon(HWND Hwnd)
     {
-        g_nid.cbSize = sizeof(g_nid);
-        g_nid.hWnd = hwnd;
-        g_nid.uID = 1;
-        g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        g_nid.uCallbackMessage = WM_TRAYICON;
+        GTrayIconData.cbSize = sizeof(GTrayIconData);
+        GTrayIconData.hWnd = Hwnd;
+        GTrayIconData.uID = 1;
+        GTrayIconData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        GTrayIconData.uCallbackMessage = WM_TRAYICON;
         // Load custom icon from resource (ID 101 defined in app.rc), fallback to default
-        g_nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
-        if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        wcscpy(g_nid.szTip, L"VideoWallpaper");
-        Shell_NotifyIconW(NIM_ADD, &g_nid);
+        GTrayIconData.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
+        if (!GTrayIconData.hIcon) GTrayIconData.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        wcscpy(GTrayIconData.szTip, L"VideoWallpaper");
+        Shell_NotifyIconW(NIM_ADD, &GTrayIconData);
     }
 
     void RemoveTrayIcon()
     {
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        Shell_NotifyIconW(NIM_DELETE, &GTrayIconData);
     }
 
-    void ShowTrayMenu(HWND hwnd)
+    void ShowTrayMenu(HWND Hwnd)
     {
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, ID_TRAY_PAUSE, g_paused ? L"Resume" : L"Pause");
-        AppendMenuW(menu, MF_STRING, ID_TRAY_MUTE, g_muted ? L"Unmute" : L"Mute");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, ID_TRAY_CHANGE_VIDEO, L"Change Video...");
-        AppendMenuW(menu, IsAutoStartEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
+        HMENU Menu = CreatePopupMenu();
+        AppendMenuW(Menu, MF_STRING, ID_TRAY_PAUSE, GbPaused ? L"Resume" : L"Pause");
+        AppendMenuW(Menu, MF_STRING, ID_TRAY_MUTE, GbMuted ? L"Unmute" : L"Mute");
+        AppendMenuW(Menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(Menu, MF_STRING, ID_TRAY_CHANGE_VIDEO, L"Change Video...");
+        AppendMenuW(Menu, IsAutoStartEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
                     ID_TRAY_AUTOSTART, L"Start with Windows");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit VideoWallpaper");
+        AppendMenuW(Menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(Menu, MF_STRING, ID_TRAY_QUIT, L"Quit VideoWallpaper");
 
-        POINT pt;
-        GetCursorPos(&pt);
-        SetForegroundWindow(hwnd);
-        TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+        POINT CursorPos;
+        GetCursorPos(&CursorPos);
+        SetForegroundWindow(Hwnd);
+        TrackPopupMenu(Menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, CursorPos.x, CursorPos.y, 0, Hwnd, nullptr);
+        DestroyMenu(Menu);
     }
 }
 
 // ---------------------------------------------------------------------------
 // Hidden message window procedure (hotkey + display change + tray)
 // ---------------------------------------------------------------------------
-LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+LRESULT CALLBACK MessageWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LParam)
 {
-    switch (msg)
+    switch (Msg)
     {
     case WM_CREATE:
-        RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT, 'Q');
-        RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT, 'P');
-        SetTimer(hwnd, 100, 500, nullptr);  // 500ms timer — sufficient for pre-seek looping
-        AddTrayIcon(hwnd);
+        RegisterHotKey(Hwnd, 1, MOD_CONTROL | MOD_ALT, 'Q');
+        RegisterHotKey(Hwnd, 2, MOD_CONTROL | MOD_ALT, 'P');
+        SetTimer(Hwnd, TimerIdUpdate, TimerIntervalMs, nullptr);
+        AddTrayIcon(Hwnd);
         return 0;
     case WM_HOTKEY:
-        if (wp == 1) DestroyWindow(hwnd);
-        if (wp == 2) SendMessageW(hwnd, WM_COMMAND, ID_TRAY_PAUSE, 0);
+        if (WParam == 1) DestroyWindow(Hwnd);
+        if (WParam == 2) SendMessageW(Hwnd, WM_COMMAND, ID_TRAY_PAUSE, 0);
         return 0;
     case WM_TRAYICON:
-        if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU)
-            ShowTrayMenu(hwnd);
+        if (LOWORD(LParam) == WM_RBUTTONUP || LOWORD(LParam) == WM_CONTEXTMENU)
+            ShowTrayMenu(Hwnd);
         return 0;
     case WM_COMMAND:
-        switch (LOWORD(wp))
+        switch (LOWORD(WParam))
         {
         case ID_TRAY_QUIT:
-            DestroyWindow(hwnd);
+            DestroyWindow(Hwnd);
             break;
         case ID_TRAY_PAUSE:
-            g_paused = !g_paused;
-            g_autoPausedByFullscreen = false;  // Manual override clears auto-pause
-            for (auto& m : g_monitors)
-                if (m.player) { g_paused ? m.player->Pause() : m.player->Play(); }
+            GbPaused = !GbPaused;
+            GbAutoPausedByFullscreen = false;  // Manual override clears auto-pause
+            for (auto& Monitor : GMonitors)
+                if (Monitor.Player) { GbPaused ? Monitor.Player->Pause() : Monitor.Player->Play(); }
             break;
         case ID_TRAY_MUTE:
-            g_muted = !g_muted;
-            for (auto& m : g_monitors)
-                if (m.player) m.player->SetMute(g_muted ? TRUE : FALSE);
+            GbMuted = !GbMuted;
+            for (auto& Monitor : GMonitors)
+                if (Monitor.Player) Monitor.Player->SetMute(GbMuted ? TRUE : FALSE);
             break;
         case ID_TRAY_CHANGE_VIDEO:
             ChangeVideo();
@@ -464,81 +506,81 @@ LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DISPLAYCHANGE:
         Log(L"Display change detected.");
         {
-            auto rects = EnumerateMonitors();
-            for (size_t i = 0; i < g_monitors.size() && i < rects.size(); ++i)
+            auto Rects = EnumerateMonitors();
+            for (size_t Index = 0; Index < GMonitors.size() && Index < Rects.size(); ++Index)
             {
-                auto& r = rects[i];
-                auto& m = g_monitors[i];
-                m.rect = r;
-                HWND parent = GetParent(m.window);
-                POINT pt = { r.left, r.top };
-                if (parent) MapWindowPoints(nullptr, parent, &pt, 1);
-                SetWindowPos(m.window, nullptr, pt.x, pt.y,
-                             r.right - r.left, r.bottom - r.top,
+                auto& MonRect = Rects[Index];
+                auto& Monitor = GMonitors[Index];
+                Monitor.Rect = MonRect;
+                HWND Parent = GetParent(Monitor.Window);
+                POINT Point = { MonRect.left, MonRect.top };
+                if (Parent) MapWindowPoints(nullptr, Parent, &Point, 1);
+                SetWindowPos(Monitor.Window, nullptr, Point.x, Point.y,
+                             MonRect.right - MonRect.left, MonRect.bottom - MonRect.top,
                              SWP_NOZORDER | SWP_NOACTIVATE);
-                if (m.player) m.player->UpdateVideo();
+                if (Monitor.Player) Monitor.Player->UpdateVideo();
             }
         }
         return 0;
     case WM_TIMER:
-        if (wp == 100)
+        if (WParam == TimerIdUpdate)
         {
             // --- Fullscreen auto-pause ---
-            if (!g_paused)  // Don't interfere with manual pause
+            if (!GbPaused)  // Don't interfere with manual pause
             {
-                bool occluded = IsDesktopOccluded();
-                if (occluded && !g_autoPausedByFullscreen)
+                bool bOccluded = IsDesktopOccluded();
+                if (bOccluded && !GbAutoPausedByFullscreen)
                 {
-                    g_autoPausedByFullscreen = true;
-                    for (auto& m : g_monitors)
-                        if (m.player) m.player->Pause();
+                    GbAutoPausedByFullscreen = true;
+                    for (auto& Monitor : GMonitors)
+                        if (Monitor.Player) Monitor.Player->Pause();
                     Log(L"Auto-paused: foreground window covers desktop.");
                 }
-                else if (!occluded && g_autoPausedByFullscreen)
+                else if (!bOccluded && GbAutoPausedByFullscreen)
                 {
-                    g_autoPausedByFullscreen = false;
-                    for (auto& m : g_monitors)
-                        if (m.player) m.player->Play();
+                    GbAutoPausedByFullscreen = false;
+                    for (auto& Monitor : GMonitors)
+                        if (Monitor.Player) Monitor.Player->Play();
                     Log(L"Auto-resumed: desktop visible.");
                 }
             }
 
             // --- Pre-seek loop ---
-            for (auto& m : g_monitors)
+            for (auto& Monitor : GMonitors)
             {
-                if (!m.player || m.duration <= 0 || g_paused || g_autoPausedByFullscreen) continue;
-                PROPVARIANT pos; PropVariantInit(&pos);
-                if (SUCCEEDED(m.player->GetPosition(MFP_POSITIONTYPE_100NS, &pos)))
+                if (!Monitor.Player || Monitor.Duration <= 0 || GbPaused || GbAutoPausedByFullscreen) continue;
+                PROPVARIANT Position; PropVariantInit(&Position);
+                if (SUCCEEDED(Monitor.Player->GetPosition(MFP_POSITIONTYPE_100NS, &Position)))
                 {
-                    LONGLONG current = pos.hVal.QuadPart;
-                    // Pre-seek when within 500ms of end
-                    if (current > 0 && (m.duration - current) < 5000000)
+                    LONGLONG CurrentPos = Position.hVal.QuadPart;
+                    // Pre-seek when within threshold of end
+                    if (CurrentPos > 0 && (Monitor.Duration - CurrentPos) < PreSeekThreshold100ns)
                     {
-                        PROPVARIANT zero; PropVariantInit(&zero);
-                        zero.vt = VT_I8; zero.hVal.QuadPart = 0;
-                        m.player->SetPosition(MFP_POSITIONTYPE_100NS, &zero);
-                        PropVariantClear(&zero);
+                        PROPVARIANT Zero; PropVariantInit(&Zero);
+                        Zero.vt = VT_I8; Zero.hVal.QuadPart = 0;
+                        Monitor.Player->SetPosition(MFP_POSITIONTYPE_100NS, &Zero);
+                        PropVariantClear(&Zero);
                         Log(L"Pre-seek loop triggered.");
                     }
                 }
-                PropVariantClear(&pos);
+                PropVariantClear(&Position);
             }
         }
         return 0;
     case WM_DESTROY:
-        KillTimer(hwnd, 100);
+        KillTimer(Hwnd, TimerIdUpdate);
         RemoveTrayIcon();
-        UnregisterHotKey(hwnd, 1);
-        UnregisterHotKey(hwnd, 2);
+        UnregisterHotKey(Hwnd, 1);
+        UnregisterHotKey(Hwnd, 2);
         ShutdownAllMonitors();
         MFShutdown();
         CoUninitialize();
         CloseLog();
-        if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); g_mutex = nullptr; }
+        if (GMutex) { ReleaseMutex(GMutex); CloseHandle(GMutex); GMutex = nullptr; }
         PostQuitMessage(0);
         return 0;
     }
-    return DefWindowProcW(hwnd, msg, wp, lp);
+    return DefWindowProcW(Hwnd, Msg, WParam, LParam);
 }
 
 // ---------------------------------------------------------------------------
@@ -546,99 +588,99 @@ LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 static void ShutdownAllMonitors()
 {
-    for (auto& m : g_monitors)
+    for (auto& Monitor : GMonitors)
     {
-        if (m.player) { m.player->Shutdown(); m.player->Release(); m.player = nullptr; }
-        if (m.window) { DestroyWindow(m.window); m.window = nullptr; }
+        if (Monitor.Player) { Monitor.Player->Shutdown(); Monitor.Player->Release(); Monitor.Player = nullptr; }
+        if (Monitor.Window) { DestroyWindow(Monitor.Window); Monitor.Window = nullptr; }
     }
-    g_monitors.clear();
+    GMonitors.clear();
 
     // Restore static wallpaper
-    if (g_desktop.workerW)
-        ShowWindow(g_desktop.workerW, SW_SHOW);
+    if (GDesktop.WorkerW)
+        ShowWindow(GDesktop.WorkerW, SW_SHOW);
 }
 
 // ---------------------------------------------------------------------------
 // Create wallpaper windows for all monitors
 // ---------------------------------------------------------------------------
-static bool CreateMonitorWallpapers(const DesktopWindows& dw)
+static bool CreateMonitorWallpapers(const FDesktopWindows& DesktopWnds)
 {
-    auto rects = EnumerateMonitors();
-    if (rects.empty()) return false;
+    auto Rects = EnumerateMonitors();
+    if (Rects.empty()) return false;
 
-    HWND insertAfter = dw.shellDefView; // First window goes below ShellDefView
+    HWND InsertAfter = DesktopWnds.ShellDefView; // First window goes below ShellDefView
 
-    for (size_t i = 0; i < rects.size(); ++i)
+    for (size_t Index = 0; Index < Rects.size(); ++Index)
     {
-        auto r = rects[i]; // copy — we'll modify for coordinate conversion
-        int w = r.right - r.left;
-        int h = r.bottom - r.top;
+        auto MonRect = Rects[Index]; // copy — we'll modify for coordinate conversion
+        int32_t Width = MonRect.right - MonRect.left;
+        int32_t Height = MonRect.bottom - MonRect.top;
 
-        MonitorWallpaper mw;
-        mw.rect = rects[i]; // keep original screen coords
+        FMonitorWallpaper MonWallpaper;
+        MonWallpaper.Rect = Rects[Index]; // keep original screen coords
 
-        if (dw.shellOnProgman)
+        if (DesktopWnds.bShellOnProgman)
         {
             // Win11 24H2+: create popup, reparent into Progman
-            mw.window = CreateWindowExW(
-                0, g_wpClass, L"",
+            MonWallpaper.Window = CreateWindowExW(
+                0, GWallpaperClassName, L"",
                 WS_POPUP | WS_VISIBLE,
-                r.left, r.top, w, h,
-                nullptr, nullptr, g_inst, nullptr
+                MonRect.left, MonRect.top, Width, Height,
+                nullptr, nullptr, GInstance, nullptr
             );
-            if (!mw.window) { Log(L"Failed to create window for monitor " + std::to_wstring(i)); continue; }
+            if (!MonWallpaper.Window) { Log(L"Failed to create window for monitor " + std::to_wstring(Index)); continue; }
 
-            SetParent(mw.window, dw.progman);
-            LONG style = GetWindowLong(mw.window, GWL_STYLE);
-            style = (style & ~WS_POPUP) | WS_CHILD;
-            SetWindowLong(mw.window, GWL_STYLE, style);
+            SetParent(MonWallpaper.Window, DesktopWnds.Progman);
+            LONG_PTR Style = GetWindowLongPtrW(MonWallpaper.Window, GWL_STYLE);
+            Style = (Style & ~WS_POPUP) | WS_CHILD;
+            SetWindowLongPtrW(MonWallpaper.Window, GWL_STYLE, Style);
 
             // Convert screen coordinates to Progman client coordinates
-            POINT pt = { r.left, r.top };
-            MapWindowPoints(nullptr, dw.progman, &pt, 1);
+            POINT Point = { MonRect.left, MonRect.top };
+            MapWindowPoints(nullptr, DesktopWnds.Progman, &Point, 1);
 
-            Log(L"Monitor " + std::to_wstring(i) + L": screen(" + std::to_wstring(r.left) + L","
-                + std::to_wstring(r.top) + L") -> client(" + std::to_wstring(pt.x) + L"," + std::to_wstring(pt.y) + L")");
+            Log(L"Monitor " + std::to_wstring(Index) + L": screen(" + std::to_wstring(MonRect.left) + L","
+                + std::to_wstring(MonRect.top) + L") -> client(" + std::to_wstring(Point.x) + L"," + std::to_wstring(Point.y) + L")");
 
-            if (insertAfter)
-                SetWindowPos(mw.window, insertAfter, pt.x, pt.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            if (InsertAfter)
+                SetWindowPos(MonWallpaper.Window, InsertAfter, Point.x, Point.y, Width, Height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
             else
-                SetWindowPos(mw.window, HWND_BOTTOM, pt.x, pt.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                SetWindowPos(MonWallpaper.Window, HWND_BOTTOM, Point.x, Point.y, Width, Height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
             // Next monitor window goes after this one in Z-order
-            insertAfter = mw.window;
+            InsertAfter = MonWallpaper.Window;
         }
         else
         {
             // Legacy: child of WorkerW — also need client coord conversion
-            HWND host = dw.workerW ? dw.workerW : dw.progman;
+            HWND Host = DesktopWnds.WorkerW ? DesktopWnds.WorkerW : DesktopWnds.Progman;
 
-            POINT pt = { r.left, r.top };
-            MapWindowPoints(nullptr, host, &pt, 1);
+            POINT Point = { MonRect.left, MonRect.top };
+            MapWindowPoints(nullptr, Host, &Point, 1);
 
-            mw.window = CreateWindowExW(
-                0, g_wpClass, L"",
+            MonWallpaper.Window = CreateWindowExW(
+                0, GWallpaperClassName, L"",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-                pt.x, pt.y, w, h,
-                host, nullptr, g_inst, nullptr
+                Point.x, Point.y, Width, Height,
+                Host, nullptr, GInstance, nullptr
             );
-            if (!mw.window) { Log(L"Failed to create window for monitor " + std::to_wstring(i)); continue; }
-            SetWindowPos(mw.window, HWND_BOTTOM, pt.x, pt.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            if (!MonWallpaper.Window) { Log(L"Failed to create window for monitor " + std::to_wstring(Index)); continue; }
+            SetWindowPos(MonWallpaper.Window, HWND_BOTTOM, Point.x, Point.y, Width, Height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
 
-        g_monitors.push_back(mw);
-        Log(L"Created window for monitor " + std::to_wstring(i) + L": "
-            + std::to_wstring(w) + L"x" + std::to_wstring(h));
+        GMonitors.push_back(MonWallpaper);
+        Log(L"Created window for monitor " + std::to_wstring(Index) + L": "
+            + std::to_wstring(Width) + L"x" + std::to_wstring(Height));
     }
 
     // Hide static wallpaper
-    if (dw.shellOnProgman && dw.workerW)
+    if (DesktopWnds.bShellOnProgman && DesktopWnds.WorkerW)
     {
-        ShowWindow(dw.workerW, SW_HIDE);
+        ShowWindow(DesktopWnds.WorkerW, SW_HIDE);
         Log(L"Hid static wallpaper WorkerW.");
     }
 
-    return !g_monitors.empty();
+    return !GMonitors.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -646,28 +688,28 @@ static bool CreateMonitorWallpapers(const DesktopWindows& dw)
 // ---------------------------------------------------------------------------
 static bool CreatePlayers()
 {
-    for (size_t i = 0; i < g_monitors.size(); ++i)
+    for (size_t Index = 0; Index < GMonitors.size(); ++Index)
     {
-        auto& m = g_monitors[i];
-        auto* cb = new MediaPlayerCallback(static_cast<int>(i));
-        HRESULT hr = MFPCreateMediaPlayer(
-            g_videoPath.c_str(), TRUE, 0, cb, m.window, &m.player
+        auto& Monitor = GMonitors[Index];
+        auto* Callback = new FMediaPlayerCallback(static_cast<int32_t>(Index));
+        HRESULT Result = MFPCreateMediaPlayer(
+            GVideoPath.c_str(), TRUE, 0, Callback, Monitor.Window, &Monitor.Player
         );
-        cb->Release();
+        Callback->Release();
 
-        if (FAILED(hr) || !m.player)
+        if (FAILED(Result) || !Monitor.Player)
         {
-            Log(L"MFPCreateMediaPlayer FAILED for monitor " + std::to_wstring(i)
-                + L" hr=" + std::to_wstring(static_cast<long>(hr)));
+            Log(L"MFPCreateMediaPlayer FAILED for monitor " + std::to_wstring(Index)
+                + L" hr=" + std::to_wstring(static_cast<long>(Result)));
             return false;
         }
 
         // Strip audio — wallpapers don't need sound, saves decoding overhead
-        m.player->SetMute(g_muted ? TRUE : FALSE);
+        Monitor.Player->SetMute(GbMuted ? TRUE : FALSE);
 
-        ShowWindow(m.window, SW_SHOW);
-        UpdateWindow(m.window);
-        Log(L"Player created for monitor " + std::to_wstring(i));
+        ShowWindow(Monitor.Window, SW_SHOW);
+        UpdateWindow(Monitor.Window);
+        Log(L"Player created for monitor " + std::to_wstring(Index));
     }
     return true;
 }
@@ -675,38 +717,37 @@ static bool CreatePlayers()
 // ---------------------------------------------------------------------------
 // Autostart helpers
 // ---------------------------------------------------------------------------
-static const wchar_t* g_autoRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static const wchar_t* g_autoRunValue = L"VideoWallpaper";
+static const wchar_t* GAutoRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* GAutoRunValue = L"VideoWallpaper";
 
 static bool IsAutoStartEnabled()
 {
-    HKEY key;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_autoRunKey, 0, KEY_READ, &key) != ERROR_SUCCESS)
+    HKEY Key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, GAutoRunKey, 0, KEY_READ, &Key) != ERROR_SUCCESS)
         return false;
-    DWORD type = 0, size = 0;
-    bool exists = RegQueryValueExW(key, g_autoRunValue, nullptr, &type, nullptr, &size) == ERROR_SUCCESS;
-    RegCloseKey(key);
-    return exists;
+    bool bExists = RegQueryValueExW(Key, GAutoRunValue, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+    RegCloseKey(Key);
+    return bExists;
 }
 
-static void SetAutoStart(bool enable)
+static void SetAutoStart(bool bEnable)
 {
-    HKEY key;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_autoRunKey, 0, KEY_WRITE, &key) != ERROR_SUCCESS)
+    HKEY Key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, GAutoRunKey, 0, KEY_WRITE, &Key) != ERROR_SUCCESS)
         return;
-    if (enable)
+    if (bEnable)
     {
-        wchar_t path[MAX_PATH];
-        GetModuleFileNameW(nullptr, path, MAX_PATH);
-        RegSetValueExW(key, g_autoRunValue, 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(path),
-                       static_cast<DWORD>((wcslen(path) + 1) * sizeof(wchar_t)));
+        wchar_t ExePath[MAX_PATH];
+        GetModuleFileNameW(nullptr, ExePath, MAX_PATH);
+        RegSetValueExW(Key, GAutoRunValue, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(ExePath),
+                       static_cast<DWORD>((wcslen(ExePath) + 1) * sizeof(wchar_t)));
     }
     else
     {
-        RegDeleteValueW(key, g_autoRunValue);
+        RegDeleteValueW(Key, GAutoRunValue);
     }
-    RegCloseKey(key);
+    RegCloseKey(Key);
 }
 
 // ---------------------------------------------------------------------------
@@ -714,57 +755,58 @@ static void SetAutoStart(bool enable)
 // ---------------------------------------------------------------------------
 static void ChangeVideo()
 {
-    wchar_t file[MAX_PATH] = {};
-    OPENFILENAMEW ofn = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = g_msgWindow;
-    ofn.lpstrFilter = L"Video Files\0*.mp4;*.wmv;*.avi;*.mkv;*.mov;*.webm\0All Files\0*.*\0";
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    ofn.lpstrTitle = L"Select Wallpaper Video";
+    wchar_t FilePath[MAX_PATH] = {};
+    OPENFILENAMEW OpenFileName = {};
+    OpenFileName.lStructSize = sizeof(OpenFileName);
+    OpenFileName.hwndOwner = GMsgWindow;
+    OpenFileName.lpstrFilter = L"Video Files\0*.mp4;*.wmv;*.avi;*.mkv;*.mov;*.webm\0All Files\0*.*\0";
+    OpenFileName.lpstrFile = FilePath;
+    OpenFileName.nMaxFile = MAX_PATH;
+    OpenFileName.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    OpenFileName.lpstrTitle = L"Select Wallpaper Video";
 
-    if (!GetOpenFileNameW(&ofn)) return;
+    if (!GetOpenFileNameW(&OpenFileName)) return;
 
     // Write to config.txt
-    std::wstring cfgPath = GetExeDir() + L"\\config.txt";
-    std::wofstream cfg(cfgPath.c_str());
-    cfg << file;
-    cfg.close();
+    std::wstring ConfigPath = GetExeDir() + L"\\config.txt";
+    std::wofstream ConfigFile(ConfigPath.c_str());
+    ConfigFile << FilePath;
+    ConfigFile.close();
 
     // Hot-reload
-    g_videoPath = file;
+    GVideoPath = FilePath;
     ShutdownAllMonitors();
-    Log(L"Reloading video: " + g_videoPath);
+    Log(L"Reloading video: " + GVideoPath);
 
-    g_desktop = FindDesktopWindows();
-    if (!g_desktop.progman) return;
+    GDesktop = FindDesktopWindows();
+    if (!GDesktop.Progman) return;
 
-    if (!g_desktop.shellOnProgman)
+    if (!GDesktop.bShellOnProgman)
     {
-        HWND host = g_desktop.workerW ? g_desktop.workerW : g_desktop.progman;
-        ShowWindow(host, SW_SHOWNA);
+        HWND Host = GDesktop.WorkerW ? GDesktop.WorkerW : GDesktop.Progman;
+        ShowWindow(Host, SW_SHOWNA);
     }
 
-    if (!CreateMonitorWallpapers(g_desktop)) return;
+    if (!CreateMonitorWallpapers(GDesktop)) return;
     if (!CreatePlayers())
     {
         MessageBoxW(nullptr, L"Failed to create player for the selected video.",
                      L"VideoWallpaper", MB_ICONERROR);
         return;
     }
-    g_paused = false;
+    GbPaused = false;
+    GbAutoPausedByFullscreen = false;
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
+int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
 {
-    g_inst = inst;
+    GInstance = Instance;
 
     // --- Single instance guard ---
-    g_mutex = CreateMutexW(nullptr, TRUE, L"Global\\VideoWallpaperMutex");
+    GMutex = CreateMutexW(nullptr, TRUE, L"Global\\VideoWallpaperMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
         MessageBoxW(nullptr, L"VideoWallpaper is already running.", L"VideoWallpaper", MB_ICONINFORMATION);
@@ -772,53 +814,53 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     }
 
     // --- Init debug logging ---
-    g_debugEnabled = IsDebugEnabled();
-    if (g_debugEnabled) Log(L"Debug logging enabled.");
+    GbDebugEnabled = IsDebugFlagPresent();
+    if (GbDebugEnabled) Log(L"Debug logging enabled.");
 
     // --- Read and validate config ---
-    g_videoPath = ReadVideoPath();
-    if (g_videoPath.empty())
+    GVideoPath = ReadVideoPath();
+    if (GVideoPath.empty())
     {
         MessageBoxW(nullptr, L"config.txt is empty or missing.\n\nPlace a video file path in config.txt next to VideoWallpaper.exe.",
                      L"VideoWallpaper", MB_ICONERROR);
         return 1;
     }
-    if (GetFileAttributesW(g_videoPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW(GVideoPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
-        std::wstring msg = L"Video file not found:\n" + g_videoPath;
-        MessageBoxW(nullptr, msg.c_str(), L"VideoWallpaper", MB_ICONERROR);
+        std::wstring ErrorMsg = L"Video file not found:\n" + GVideoPath;
+        MessageBoxW(nullptr, ErrorMsg.c_str(), L"VideoWallpaper", MB_ICONERROR);
         return 1;
     }
-    Log(L"Video path: " + g_videoPath);
+    Log(L"Video path: " + GVideoPath);
 
     // --- COM & Media Foundation ---
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     if (FAILED(MFStartup(MF_VERSION))) { CoUninitialize(); return 1; }
 
     // --- Register window classes ---
-    WNDCLASSW wc{};
-    wc.lpfnWndProc   = WpWndProc;
-    wc.hInstance      = inst;
-    wc.lpszClassName  = g_wpClass;
-    wc.hbrBackground  = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    RegisterClassW(&wc);
+    WNDCLASSW WallpaperWndClass{};
+    WallpaperWndClass.lpfnWndProc   = WallpaperWndProc;
+    WallpaperWndClass.hInstance      = Instance;
+    WallpaperWndClass.lpszClassName  = GWallpaperClassName;
+    WallpaperWndClass.hbrBackground  = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    RegisterClassW(&WallpaperWndClass);
 
-    const wchar_t* msgClass = L"VideoWallpaperMsgClass";
-    WNDCLASSW mc{};
-    mc.lpfnWndProc   = MsgWndProc;
-    mc.hInstance      = inst;
-    mc.lpszClassName  = msgClass;
-    RegisterClassW(&mc);
+    const wchar_t* MsgClassName = L"VideoWallpaperMsgClass";
+    WNDCLASSW MsgWndClass{};
+    MsgWndClass.lpfnWndProc   = MessageWndProc;
+    MsgWndClass.hInstance      = Instance;
+    MsgWndClass.lpszClassName  = MsgClassName;
+    RegisterClassW(&MsgWndClass);
 
     // --- Find desktop windows (retry for up to 30s at boot) ---
-    for (int attempt = 0; attempt < 30; ++attempt)
+    for (int32_t Attempt = 0; Attempt < MaxDesktopRetries; ++Attempt)
     {
-        g_desktop = FindDesktopWindows();
-        if (g_desktop.progman) break;
+        GDesktop = FindDesktopWindows();
+        if (GDesktop.Progman) break;
         Log(L"Desktop not ready, retrying in 1s...");
         Sleep(1000);
     }
-    if (!g_desktop.progman)
+    if (!GDesktop.Progman)
     {
         MessageBoxW(nullptr, L"Could not find the desktop window (Progman).", L"VideoWallpaper", MB_ICONERROR);
         MFShutdown(); CoUninitialize();
@@ -826,14 +868,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     }
 
     // --- Show host for legacy mode ---
-    if (!g_desktop.shellOnProgman)
+    if (!GDesktop.bShellOnProgman)
     {
-        HWND host = g_desktop.workerW ? g_desktop.workerW : g_desktop.progman;
-        ShowWindow(host, SW_SHOWNA);
+        HWND Host = GDesktop.WorkerW ? GDesktop.WorkerW : GDesktop.Progman;
+        ShowWindow(Host, SW_SHOWNA);
     }
 
     // --- Create per-monitor wallpaper windows ---
-    if (!CreateMonitorWallpapers(g_desktop))
+    if (!CreateMonitorWallpapers(GDesktop))
     {
         MessageBoxW(nullptr, L"Failed to create wallpaper windows.", L"VideoWallpaper", MB_ICONERROR);
         MFShutdown(); CoUninitialize();
@@ -843,8 +885,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     // --- Create a player per monitor ---
     if (!CreatePlayers())
     {
-        std::wstring msg = L"Failed to create media player.\n\nFile: " + g_videoPath;
-        MessageBoxW(nullptr, msg.c_str(), L"VideoWallpaper", MB_ICONERROR);
+        std::wstring ErrorMsg = L"Failed to create media player.\n\nFile: " + GVideoPath;
+        MessageBoxW(nullptr, ErrorMsg.c_str(), L"VideoWallpaper", MB_ICONERROR);
         ShutdownAllMonitors();
         MFShutdown(); CoUninitialize();
         return 1;
@@ -855,18 +897,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     Log(L"Working set trimmed after player init.");
 
     // --- Hidden message window for hotkey & display change ---
-    g_msgWindow = CreateWindowExW(
-        0, msgClass, L"", 0,
+    GMsgWindow = CreateWindowExW(
+        0, MsgClassName, L"", 0,
         0, 0, 0, 0,
-        HWND_MESSAGE, nullptr, inst, nullptr
+        HWND_MESSAGE, nullptr, Instance, nullptr
     );
+    if (!GMsgWindow)
+    {
+        Log(L"ERROR: Failed to create message window.");
+        ShutdownAllMonitors();
+        MFShutdown(); CoUninitialize();
+        return 1;
+    }
 
     // --- Message loop ---
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0)
+    MSG Msg;
+    while (GetMessageW(&Msg, nullptr, 0, 0) > 0)
     {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        TranslateMessage(&Msg);
+        DispatchMessageW(&Msg);
     }
-    return static_cast<int>(msg.wParam);
+    return static_cast<int>(Msg.wParam);
 }
