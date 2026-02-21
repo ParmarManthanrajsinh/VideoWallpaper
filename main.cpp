@@ -5,11 +5,13 @@
 // Press Ctrl+Alt+Q to quit.
 
 #include <windows.h>
+#include <psapi.h>       // EmptyWorkingSet
 #include <mfplay.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <shlwapi.h>
 #include <propvarutil.h>
+#include <commdlg.h>
 
 #include <fstream>
 #include <string>
@@ -22,6 +24,8 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 // ---------------------------------------------------------------------------
@@ -29,6 +33,9 @@
 // ---------------------------------------------------------------------------
 namespace { struct MonitorWallpaper; }
 static void ShutdownAllMonitors();
+static void ChangeVideo();
+static bool IsAutoStartEnabled();
+static void SetAutoStart(bool enable);
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -40,6 +47,8 @@ namespace
     bool g_debugEnabled = false;
     std::ofstream g_logFile;
     std::wstring g_videoPath;
+    bool g_paused = false;
+    bool g_muted = true;
     HINSTANCE g_inst = nullptr;
     const wchar_t* g_wpClass = L"VideoWallpaperClass";
 
@@ -49,6 +58,7 @@ namespace
         HWND window = nullptr;
         IMFPMediaPlayer* player = nullptr;
         RECT rect = {};
+        LONGLONG duration = 0;  // Video duration in 100ns units
     };
     std::vector<MonitorWallpaper> g_monitors;
 
@@ -88,6 +98,7 @@ namespace
             g_logFile.open(logPath.c_str());
         }
         g_logFile << std::string(msg.begin(), msg.end()) << '\n';
+        g_logFile.flush();  // Flush immediately so we can close early if needed
     }
 
     void CloseLog()
@@ -245,10 +256,21 @@ namespace
             switch (hdr->eEventType)
             {
             case MFP_EVENT_TYPE_MEDIAITEM_SET:
+            {
                 Log(L"Monitor " + std::to_wstring(monIdx_) + L": Playing.");
+                // Capture duration for seamless looping
+                auto* evt = reinterpret_cast<MFP_MEDIAITEM_SET_EVENT*>(hdr);
+                if (evt->pMediaItem)
+                {
+                    PROPVARIANT dur; PropVariantInit(&dur);
+                    if (SUCCEEDED(evt->pMediaItem->GetDuration(MFP_POSITIONTYPE_100NS, &dur)))
+                        g_monitors[monIdx_].duration = dur.hVal.QuadPart;
+                    PropVariantClear(&dur);
+                }
                 player->Play();
                 player->UpdateVideo();
                 break;
+            }
             case MFP_EVENT_TYPE_PLAYBACK_ENDED:
                 Log(L"Monitor " + std::to_wstring(monIdx_) + L": Looping.");
                 {
@@ -304,6 +326,10 @@ LRESULT CALLBACK WpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_QUIT 1001
+#define ID_TRAY_PAUSE 1002
+#define ID_TRAY_MUTE 1003
+#define ID_TRAY_CHANGE_VIDEO 1004
+#define ID_TRAY_AUTOSTART 1005
 
 namespace
 {
@@ -331,6 +357,13 @@ namespace
     void ShowTrayMenu(HWND hwnd)
     {
         HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, ID_TRAY_PAUSE, g_paused ? L"Resume" : L"Pause");
+        AppendMenuW(menu, MF_STRING, ID_TRAY_MUTE, g_muted ? L"Unmute" : L"Mute");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, ID_TRAY_CHANGE_VIDEO, L"Change Video...");
+        AppendMenuW(menu, IsAutoStartEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
+                    ID_TRAY_AUTOSTART, L"Start with Windows");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit VideoWallpaper");
 
         POINT pt;
@@ -350,18 +383,41 @@ LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_CREATE:
         RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT, 'Q');
+        RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT, 'P');
+        SetTimer(hwnd, 100, 500, nullptr);  // 500ms timer — sufficient for pre-seek looping
         AddTrayIcon(hwnd);
         return 0;
     case WM_HOTKEY:
         if (wp == 1) DestroyWindow(hwnd);
+        if (wp == 2) SendMessageW(hwnd, WM_COMMAND, ID_TRAY_PAUSE, 0);
         return 0;
     case WM_TRAYICON:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU)
             ShowTrayMenu(hwnd);
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) == ID_TRAY_QUIT)
+        switch (LOWORD(wp))
+        {
+        case ID_TRAY_QUIT:
             DestroyWindow(hwnd);
+            break;
+        case ID_TRAY_PAUSE:
+            g_paused = !g_paused;
+            for (auto& m : g_monitors)
+                if (m.player) { g_paused ? m.player->Pause() : m.player->Play(); }
+            break;
+        case ID_TRAY_MUTE:
+            g_muted = !g_muted;
+            for (auto& m : g_monitors)
+                if (m.player) m.player->SetMute(g_muted ? TRUE : FALSE);
+            break;
+        case ID_TRAY_CHANGE_VIDEO:
+            ChangeVideo();
+            break;
+        case ID_TRAY_AUTOSTART:
+            SetAutoStart(!IsAutoStartEnabled());
+            break;
+        }
         return 0;
     case WM_DISPLAYCHANGE:
         Log(L"Display change detected.");
@@ -382,9 +438,35 @@ LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         return 0;
+    case WM_TIMER:
+        if (wp == 100)
+        {
+            for (auto& m : g_monitors)
+            {
+                if (!m.player || m.duration <= 0 || g_paused) continue;
+                PROPVARIANT pos; PropVariantInit(&pos);
+                if (SUCCEEDED(m.player->GetPosition(MFP_POSITIONTYPE_100NS, &pos)))
+                {
+                    LONGLONG current = pos.hVal.QuadPart;
+                    // Pre-seek when within 500ms of end
+                    if (current > 0 && (m.duration - current) < 5000000)
+                    {
+                        PROPVARIANT zero; PropVariantInit(&zero);
+                        zero.vt = VT_I8; zero.hVal.QuadPart = 0;
+                        m.player->SetPosition(MFP_POSITIONTYPE_100NS, &zero);
+                        PropVariantClear(&zero);
+                        Log(L"Pre-seek loop triggered.");
+                    }
+                }
+                PropVariantClear(&pos);
+            }
+        }
+        return 0;
     case WM_DESTROY:
+        KillTimer(hwnd, 100);
         RemoveTrayIcon();
         UnregisterHotKey(hwnd, 1);
+        UnregisterHotKey(hwnd, 2);
         ShutdownAllMonitors();
         MFShutdown();
         CoUninitialize();
@@ -407,6 +489,10 @@ static void ShutdownAllMonitors()
         if (m.window) { DestroyWindow(m.window); m.window = nullptr; }
     }
     g_monitors.clear();
+
+    // Restore static wallpaper
+    if (g_desktop.workerW)
+        ShowWindow(g_desktop.workerW, SW_SHOW);
 }
 
 // ---------------------------------------------------------------------------
@@ -514,13 +600,97 @@ static bool CreatePlayers()
         }
 
         // Strip audio — wallpapers don't need sound, saves decoding overhead
-        m.player->SetMute(TRUE);
+        m.player->SetMute(g_muted ? TRUE : FALSE);
 
         ShowWindow(m.window, SW_SHOW);
         UpdateWindow(m.window);
         Log(L"Player created for monitor " + std::to_wstring(i));
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Autostart helpers
+// ---------------------------------------------------------------------------
+static const wchar_t* g_autoRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* g_autoRunValue = L"VideoWallpaper";
+
+static bool IsAutoStartEnabled()
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_autoRunKey, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0, size = 0;
+    bool exists = RegQueryValueExW(key, g_autoRunValue, nullptr, &type, nullptr, &size) == ERROR_SUCCESS;
+    RegCloseKey(key);
+    return exists;
+}
+
+static void SetAutoStart(bool enable)
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_autoRunKey, 0, KEY_WRITE, &key) != ERROR_SUCCESS)
+        return;
+    if (enable)
+    {
+        wchar_t path[MAX_PATH];
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        RegSetValueExW(key, g_autoRunValue, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(path),
+                       static_cast<DWORD>((wcslen(path) + 1) * sizeof(wchar_t)));
+    }
+    else
+    {
+        RegDeleteValueW(key, g_autoRunValue);
+    }
+    RegCloseKey(key);
+}
+
+// ---------------------------------------------------------------------------
+// Change video (hot-reload)
+// ---------------------------------------------------------------------------
+static void ChangeVideo()
+{
+    wchar_t file[MAX_PATH] = {};
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_msgWindow;
+    ofn.lpstrFilter = L"Video Files\0*.mp4;*.wmv;*.avi;*.mkv;*.mov;*.webm\0All Files\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.lpstrTitle = L"Select Wallpaper Video";
+
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    // Write to config.txt
+    std::wstring cfgPath = GetExeDir() + L"\\config.txt";
+    std::wofstream cfg(cfgPath.c_str());
+    cfg << file;
+    cfg.close();
+
+    // Hot-reload
+    g_videoPath = file;
+    ShutdownAllMonitors();
+    Log(L"Reloading video: " + g_videoPath);
+
+    g_desktop = FindDesktopWindows();
+    if (!g_desktop.progman) return;
+
+    if (!g_desktop.shellOnProgman)
+    {
+        HWND host = g_desktop.workerW ? g_desktop.workerW : g_desktop.progman;
+        ShowWindow(host, SW_SHOWNA);
+    }
+
+    if (!CreateMonitorWallpapers(g_desktop)) return;
+    if (!CreatePlayers())
+    {
+        MessageBoxW(nullptr, L"Failed to create player for the selected video.",
+                     L"VideoWallpaper", MB_ICONERROR);
+        return;
+    }
+    g_paused = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,8 +747,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     mc.lpszClassName  = msgClass;
     RegisterClassW(&mc);
 
-    // --- Find desktop windows ---
-    g_desktop = FindDesktopWindows();
+    // --- Find desktop windows (retry for up to 30s at boot) ---
+    for (int attempt = 0; attempt < 30; ++attempt)
+    {
+        g_desktop = FindDesktopWindows();
+        if (g_desktop.progman) break;
+        Log(L"Desktop not ready, retrying in 1s...");
+        Sleep(1000);
+    }
     if (!g_desktop.progman)
     {
         MessageBoxW(nullptr, L"Could not find the desktop window (Progman).", L"VideoWallpaper", MB_ICONERROR);
@@ -610,6 +786,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         MFShutdown(); CoUninitialize();
         return 1;
     }
+
+    // --- Trim working set: reclaim cached pages from MF/COM init ---
+    EmptyWorkingSet(GetCurrentProcess());
+    Log(L"Working set trimmed after player init.");
 
     // --- Hidden message window for hotkey & display change ---
     g_msgWindow = CreateWindowExW(

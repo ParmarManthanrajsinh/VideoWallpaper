@@ -15,7 +15,7 @@ set RESOURCE=app.rc
 set RESOURCE_OBJ=app_res.o
 
 :: Libraries to link against (MinGW)
-set LIBS=-lmfplay -lmfplat -lmfuuid -lmf -lole32 -lshlwapi -lgdi32 -luser32 -lshell32
+set LIBS=-lmfplay -lmfplat -lmfuuid -lmf -lole32 -lshlwapi -lgdi32 -luser32 -lshell32 -lcomdlg32 -ladvapi32 -lpsapi
 
 :: Compiler flags
 :: -static to avoid dependency on MinGW DLLs
