@@ -33,3 +33,21 @@ END
 // App icon
 #define IDI_APPICON 101
 IDI_APPICON ICON "app.ico"
+
+// Per-Monitor V2 DPI awareness manifest
+// Without this, Windows reports logical (scaled) coordinates and the wallpaper
+// only covers a fraction of the physical screen (e.g. 80% at 125% DPI scaling).
+1 RT_MANIFEST
+BEGIN
+    "<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>\r\n"
+    "<assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0"">\r\n"
+    "  <assemblyIdentity version=""1.0.0.0"" processorArchitecture=""*""\r\n"
+    "    name=""VideoWallpaper"" type=""win32""/>\r\n"
+    "  <application xmlns=""urn:schemas-microsoft-com:asm.v3"">\r\n"
+    "    <windowsSettings>\r\n"
+    "      <dpiAware xmlns=""http://schemas.microsoft.com/SMI/2005/WindowsSettings"">True/PM</dpiAware>\r\n"
+    "      <dpiAwareness xmlns=""http://schemas.microsoft.com/SMI/2016/WindowsSettings"">PerMonitorV2, PerMonitor</dpiAwareness>\r\n"
+    "    </windowsSettings>\r\n"
+    "  </application>\r\n"
+    "</assembly>\r\n"
+END

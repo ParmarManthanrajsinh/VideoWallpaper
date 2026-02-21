@@ -12,6 +12,11 @@
 #include <shlwapi.h>
 #include <propvarutil.h>
 #include <commdlg.h>
+#include <evr.h>
+
+// MR_VIDEO_RENDER_SERVICE GUID (not exported by MinGW's import libs)
+static const GUID LOCAL_MR_VIDEO_RENDER_SERVICE =
+    { 0x1092a86c, 0xab1a, 0x459a, { 0xa3, 0x36, 0x83, 0x1f, 0xbc, 0x4d, 0x11, 0xf4 } };
 
 #include <cstdint>
 #include <fstream>
@@ -252,7 +257,7 @@ namespace
         }
 
         Log(L"Legacy WorkerW mode.");
-        for (int32_t Attempt = 0; Attempt < 20; ++Attempt)
+        for (int32_t Attempt = 0; Attempt < 50; ++Attempt)
         {
             FLegacySearch LegacySearch;
             EnumWindows(LegacyEnumProc, reinterpret_cast<LPARAM>(&LegacySearch));
@@ -268,6 +273,9 @@ namespace
                 );
                 return DesktopWnds;
             }
+            // Re-send the trigger each attempt — Explorer sometimes needs multiple nudges
+            SendMessageTimeoutW(DesktopWnds.Progman, WM_SPAWN_WORKERW, 0, 0,
+                               SMTO_BLOCK | SMTO_NORMAL, 500, &Result);
             Sleep(100);
         }
         Log(L"Legacy mode: timeout.");
@@ -362,6 +370,20 @@ namespace
                 }
                 Player->Play();
                 Player->UpdateVideo();
+
+                // Fix: disable letterboxing — stretch video to fill the window
+                {
+                    IMFVideoDisplayControl* pVDC = nullptr;
+                    if (SUCCEEDED(MFGetService(
+                        Player,
+                        LOCAL_MR_VIDEO_RENDER_SERVICE,
+                        __uuidof(IMFVideoDisplayControl),
+                        reinterpret_cast<void**>(&pVDC))))
+                    {
+                        pVDC->SetAspectRatioMode(MFVideoARMode_None);
+                        pVDC->Release();
+                    }
+                }
                 break;
             }
             case MFP_EVENT_TYPE_PLAYBACK_ENDED:
@@ -845,16 +867,17 @@ namespace
 
                 if (InsertAfter)
                 {
-                    SetWindowPos
-                    (
-                        MonWallpaper.Window, 
-                        InsertAfter, 
-                        Point.x, 
-                        Point.y, 
-                        Width, 
-                        Height, 
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW
-                    );
+                    // First send to absolute bottom so it's behind everything,
+                    // then bring back up to just below ShellDefView.
+                    // This guarantees desktop icons always appear in front.
+                    SetWindowPos(
+                        MonWallpaper.Window, HWND_BOTTOM,
+                        Point.x, Point.y, Width, Height,
+                        SWP_NOACTIVATE);
+                    SetWindowPos(
+                        MonWallpaper.Window, InsertAfter,
+                        Point.x, Point.y, Width, Height,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 }
                 else
                 {
@@ -1067,6 +1090,21 @@ namespace
 
 int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
 {
+    // Enable per-monitor V2 DPI awareness so EnumDisplayMonitors returns physical
+    // pixel coordinates. Without this, the wallpaper only covers ~80% of the screen
+    // at 125% DPI scaling. We load dynamically to stay compatible with old MinGW headers.
+    {
+        typedef BOOL(WINAPI* SetProcessDpiAwarenessContext_t)(HANDLE);
+        HMODULE User32 = GetModuleHandleW(L"user32.dll");
+        auto Fn = User32
+            ? reinterpret_cast<SetProcessDpiAwarenessContext_t>(
+                GetProcAddress(User32, "SetProcessDpiAwarenessContext"))
+            : nullptr;
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4
+        if (Fn) Fn(reinterpret_cast<HANDLE>(-4));
+        else    SetProcessDPIAware(); // Vista+ fallback
+    }
+
     GInstance = Instance;
 
     GMutex = CreateMutexW(nullptr, TRUE, L"Global\\VideoWallpaperMutex");
@@ -1125,13 +1163,24 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
     for (int32_t Attempt = 0; Attempt < MaxDesktopRetries; ++Attempt)
     {
         GDesktop = FindDesktopWindows();
-        if (GDesktop.Progman) break;
-        Log(L"Desktop not ready, retrying in 1s...");
+        // On Win11: need Progman. On Win10: also need WorkerW (the blank one used as host).
+        bool bReady = GDesktop.bShellOnProgman
+            ? GDesktop.Progman != nullptr
+            : (GDesktop.Progman != nullptr && GDesktop.WorkerW != nullptr);
+        if (bReady) break;
+        Log(L"Desktop not ready (attempt " + std::to_wstring(Attempt + 1) + L"), retrying in 1s...");
         Sleep(1000);
     }
     if (!GDesktop.Progman)
     {
         MessageBoxW(nullptr, L"Could not find the desktop window (Progman).", L"VideoWallpaper", MB_ICONERROR);
+        MFShutdown(); CoUninitialize();
+        return 1;
+    }
+    // On Win10, WorkerW is required — without it we can't place the wallpaper behind icons
+    if (!GDesktop.bShellOnProgman && !GDesktop.WorkerW)
+    {
+        MessageBoxW(nullptr, L"Could not find a suitable desktop layer.\n\nPlease ensure Windows Explorer is running.", L"VideoWallpaper", MB_ICONERROR);
         MFShutdown(); CoUninitialize();
         return 1;
     }
