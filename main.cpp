@@ -5,7 +5,7 @@
 // Press Ctrl+Alt+Q to quit.
 
 #include <windows.h>
-#include <psapi.h>       // EmptyWorkingSet
+#include <psapi.h>
 #include <mfplay.h>
 #include <mfapi.h>
 #include <mfidl.h>
