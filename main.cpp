@@ -29,9 +29,6 @@
 #pragma comment(lib, "advapi32.lib")
 #endif
 
-// ---------------------------------------------------------------------------
-// Named constants
-// ---------------------------------------------------------------------------
 
 /** Undocumented Progman message to spawn a WorkerW behind the desktop icons. */
 static constexpr UINT WM_SPAWN_WORKERW = 0x052C;
@@ -51,22 +48,17 @@ static constexpr int32_t MaxDesktopRetries = 30;
 /** Size of class name buffers for GetClassNameW calls. */
 static constexpr int32_t ClassNameBufferSize = 64;
 
-// ---------------------------------------------------------------------------
-// Forward declarations
-// ---------------------------------------------------------------------------
 namespace { struct FMonitorWallpaper; }
 static void ShutdownAllMonitors();
 static void ChangeVideo();
 static bool IsAutoStartEnabled();
 static void SetAutoStart(bool bEnable);
 
-// ---------------------------------------------------------------------------
-// Globals
-// ---------------------------------------------------------------------------
 namespace
 {
     HANDLE GMutex = nullptr;
-    HWND GMsgWindow = nullptr;         // Hidden message-only window for hotkey
+    HWND GMsgWindow = nullptr;
+
     bool GbDebugEnabled = false;
     std::ofstream GLogFile;
     std::wstring GVideoPath;
@@ -76,17 +68,16 @@ namespace
     HINSTANCE GInstance = nullptr;
     const wchar_t* GWallpaperClassName = L"VideoWallpaperClass";
 
-    // Per-monitor data
     struct FMonitorWallpaper
     {
         HWND Window = nullptr;
         IMFPMediaPlayer* Player = nullptr;
         RECT Rect = {};
-        LONGLONG Duration = 0;  // Video duration in 100ns units
+        LONGLONG Duration = 0;
+
     };
     std::vector<FMonitorWallpaper> GMonitors;
 
-    // Desktop detection result
     struct FDesktopWindows
     {
         HWND Progman       = nullptr;
@@ -96,9 +87,6 @@ namespace
     };
     FDesktopWindows GDesktop;
 
-    // ---------------------------------------------------------------------------
-    // Logging (only active when debug.flag file exists next to .exe)
-    // ---------------------------------------------------------------------------
     std::wstring GetExeDir()
     {
         wchar_t Dir[MAX_PATH] = {};
@@ -121,7 +109,6 @@ namespace
             std::wstring LogPath = GetExeDir() + L"\\debug.log";
             GLogFile.open(LogPath.c_str());
         }
-        // Convert wide string to UTF-8 for proper Unicode support
         int32_t SizeNeeded = WideCharToMultiByte(CP_UTF8, 0, Message.c_str(),
                                                   static_cast<int>(Message.size()),
                                                   nullptr, 0, nullptr, nullptr);
@@ -133,7 +120,8 @@ namespace
                                 &Utf8[0], SizeNeeded, nullptr, nullptr);
             GLogFile << Utf8 << '\n';
         }
-        GLogFile.flush();  // Flush immediately so we can close early if needed
+        GLogFile.flush();
+
     }
 
     void CloseLog()
@@ -141,9 +129,6 @@ namespace
         if (GLogFile.is_open()) GLogFile.close();
     }
 
-    // ---------------------------------------------------------------------------
-    // Config
-    // ---------------------------------------------------------------------------
     std::wstring TrimString(const std::wstring& InString)
     {
         const wchar_t* Whitespace = L" \t\r\n\"";
@@ -162,9 +147,6 @@ namespace
         return TrimString(Path);
     }
 
-    // ---------------------------------------------------------------------------
-    // Desktop window detection (Win10 legacy AND Win11 24H2+)
-    // ---------------------------------------------------------------------------
     struct FLegacySearch
     {
         HWND WorkerWithShell = nullptr;
@@ -238,9 +220,6 @@ namespace
         return DesktopWnds;
     }
 
-    // ---------------------------------------------------------------------------
-    // Monitor enumeration
-    // ---------------------------------------------------------------------------
     BOOL CALLBACK MonitorEnumProc(HMONITOR, HDC, LPRECT InRect, LPARAM LParam)
     {
         auto* Rects = reinterpret_cast<std::vector<RECT>*>(LParam);
@@ -263,9 +242,6 @@ namespace
         return Rects;
     }
 
-    // ---------------------------------------------------------------------------
-    // MFPlay callback — finds its player in GMonitors by HWND
-    // ---------------------------------------------------------------------------
     class FMediaPlayerCallback final : public IMFPMediaPlayerCallback
     {
     public:
@@ -301,7 +277,6 @@ namespace
             case MFP_EVENT_TYPE_MEDIAITEM_SET:
             {
                 Log(L"Monitor " + std::to_wstring(MonitorIndex) + L": Playing.");
-                // Capture duration for seamless looping
                 auto* Event = reinterpret_cast<MFP_MEDIAITEM_SET_EVENT*>(Header);
                 if (Event->pMediaItem)
                 {
@@ -338,9 +313,6 @@ namespace
     };
 }
 
-// ---------------------------------------------------------------------------
-// Fullscreen / maximized detection
-// ---------------------------------------------------------------------------
 
 /** Dynamically checks if DWM is currently cloaking the window. */
 static bool IsWindowCloaked(HWND Hwnd)
@@ -353,7 +325,6 @@ static bool IsWindowCloaked(HWND Hwnd)
     if (DwmGetWindowAttributeFn)
     {
         int32_t Cloaked = 0;
-        // DWMWA_CLOAKED = 14
         if (SUCCEEDED(DwmGetWindowAttributeFn(Hwnd, 14, &Cloaked, sizeof(Cloaked))))
         {
             return Cloaked != 0;
@@ -365,11 +336,9 @@ static bool IsWindowCloaked(HWND Hwnd)
 /** Returns true if a single window covers at least one full monitor. */
 static bool IsWindowCoveringMonitor(HWND Hwnd)
 {
-    // Maximized window covers the full work area
     if (IsZoomed(Hwnd))
         return true;
 
-    // Check for borderless fullscreen (games, video players)
     LONG_PTR Style = GetWindowLongPtrW(Hwnd, GWL_STYLE);
     bool bNoBorder = !(Style & WS_CAPTION) || !(Style & WS_THICKFRAME);
     if (!bNoBorder) return false;
@@ -403,20 +372,17 @@ static BOOL CALLBACK OcclusionEnumProc(HWND Hwnd, LPARAM LParam)
 {
     bool* bOutOccluded = reinterpret_cast<bool*>(LParam);
 
-    // Skip invisible, minimized, shell, and our own wallpaper windows
     if (!IsWindowVisible(Hwnd)) return TRUE;
-    if (IsIconic(Hwnd)) return TRUE;  // Minimized windows don't cover the desktop
+    if (IsIconic(Hwnd)) return TRUE;
 
-    // Skip tool windows (e.g. invisible NVIDIA GeForce Overlay, tooltips)
+
     LONG_PTR ExStyle = GetWindowLongPtrW(Hwnd, GWL_EXSTYLE);
     if (ExStyle & WS_EX_TOOLWINDOW) return TRUE;
 
-    // Skip DWM Cloaked windows (invisible UWP background apps)
     if (IsWindowCloaked(Hwnd)) return TRUE;
 
     if (IsShellWindow(Hwnd)) return TRUE;
 
-    // Skip our own wallpaper windows
     for (const auto& Monitor : GMonitors)
     {
         if (Monitor.Window == Hwnd) return TRUE;
@@ -425,7 +391,8 @@ static BOOL CALLBACK OcclusionEnumProc(HWND Hwnd, LPARAM LParam)
     if (IsWindowCoveringMonitor(Hwnd))
     {
         *bOutOccluded = true;
-        return FALSE;  // Stop enumeration early
+        return FALSE;
+
     }
     return TRUE;
 }
@@ -438,9 +405,6 @@ static bool IsDesktopOccluded()
     return bOccluded;
 }
 
-// ---------------------------------------------------------------------------
-// Wallpaper window procedure (per-monitor windows)
-// ---------------------------------------------------------------------------
 LRESULT CALLBACK WallpaperWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LParam)
 {
     switch (Msg)
@@ -464,9 +428,6 @@ LRESULT CALLBACK WallpaperWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LPa
     return DefWindowProcW(Hwnd, Msg, WParam, LParam);
 }
 
-// ---------------------------------------------------------------------------
-// System tray
-// ---------------------------------------------------------------------------
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_QUIT 1001
 #define ID_TRAY_PAUSE 1002
@@ -485,7 +446,6 @@ namespace
         GTrayIconData.uID = 1;
         GTrayIconData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         GTrayIconData.uCallbackMessage = WM_TRAYICON;
-        // Load custom icon from resource (ID 101 defined in app.rc), fallback to default
         GTrayIconData.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
         if (!GTrayIconData.hIcon) GTrayIconData.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
         wcscpy(GTrayIconData.szTip, L"VideoWallpaper");
@@ -517,9 +477,6 @@ namespace
     }
 }
 
-// ---------------------------------------------------------------------------
-// Hidden message window procedure (hotkey + display change + tray)
-// ---------------------------------------------------------------------------
 LRESULT CALLBACK MessageWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LParam)
 {
     switch (Msg)
@@ -546,7 +503,8 @@ LRESULT CALLBACK MessageWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LPara
             break;
         case ID_TRAY_PAUSE:
             GbPaused = !GbPaused;
-            GbAutoPausedByFullscreen = false;  // Manual override clears auto-pause
+            GbAutoPausedByFullscreen = false;
+
             for (auto& Monitor : GMonitors)
                 if (Monitor.Player) { GbPaused ? Monitor.Player->Pause() : Monitor.Player->Play(); }
             break;
@@ -585,8 +543,8 @@ LRESULT CALLBACK MessageWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LPara
     case WM_TIMER:
         if (WParam == TimerIdUpdate)
         {
-            // --- Fullscreen auto-pause ---
-            if (!GbPaused)  // Don't interfere with manual pause
+            if (!GbPaused)
+
             {
                 bool bOccluded = IsDesktopOccluded();
                 if (bOccluded && !GbAutoPausedByFullscreen)
@@ -605,7 +563,6 @@ LRESULT CALLBACK MessageWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LPara
                 }
             }
 
-            // --- Pre-seek loop ---
             for (auto& Monitor : GMonitors)
             {
                 if (!Monitor.Player || Monitor.Duration <= 0 || GbPaused || GbAutoPausedByFullscreen) continue;
@@ -613,7 +570,6 @@ LRESULT CALLBACK MessageWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LPara
                 if (SUCCEEDED(Monitor.Player->GetPosition(MFP_POSITIONTYPE_100NS, &Position)))
                 {
                     LONGLONG CurrentPos = Position.hVal.QuadPart;
-                    // Pre-seek when within threshold of end
                     if (CurrentPos > 0 && (Monitor.Duration - CurrentPos) < PreSeekThreshold100ns)
                     {
                         PROPVARIANT Zero; PropVariantInit(&Zero);
@@ -643,9 +599,6 @@ LRESULT CALLBACK MessageWndProc(HWND Hwnd, UINT Msg, WPARAM WParam, LPARAM LPara
     return DefWindowProcW(Hwnd, Msg, WParam, LParam);
 }
 
-// ---------------------------------------------------------------------------
-// Shutdown all per-monitor players
-// ---------------------------------------------------------------------------
 static void ShutdownAllMonitors()
 {
     for (auto& Monitor : GMonitors)
@@ -655,33 +608,31 @@ static void ShutdownAllMonitors()
     }
     GMonitors.clear();
 
-    // Restore static wallpaper
     if (GDesktop.WorkerW)
         ShowWindow(GDesktop.WorkerW, SW_SHOW);
 }
 
-// ---------------------------------------------------------------------------
-// Create wallpaper windows for all monitors
-// ---------------------------------------------------------------------------
 static bool CreateMonitorWallpapers(const FDesktopWindows& DesktopWnds)
 {
     auto Rects = EnumerateMonitors();
     if (Rects.empty()) return false;
 
-    HWND InsertAfter = DesktopWnds.ShellDefView; // First window goes below ShellDefView
+    HWND InsertAfter = DesktopWnds.ShellDefView;
+
 
     for (size_t Index = 0; Index < Rects.size(); ++Index)
     {
-        auto MonRect = Rects[Index]; // copy — we'll modify for coordinate conversion
+        auto MonRect = Rects[Index];
+
         int32_t Width = MonRect.right - MonRect.left;
         int32_t Height = MonRect.bottom - MonRect.top;
 
         FMonitorWallpaper MonWallpaper;
-        MonWallpaper.Rect = Rects[Index]; // keep original screen coords
+        MonWallpaper.Rect = Rects[Index];
+
 
         if (DesktopWnds.bShellOnProgman)
         {
-            // Win11 24H2+: create popup, reparent into Progman
             MonWallpaper.Window = CreateWindowExW(
                 0, GWallpaperClassName, L"",
                 WS_POPUP | WS_VISIBLE,
@@ -695,7 +646,6 @@ static bool CreateMonitorWallpapers(const FDesktopWindows& DesktopWnds)
             Style = (Style & ~WS_POPUP) | WS_CHILD;
             SetWindowLongPtrW(MonWallpaper.Window, GWL_STYLE, Style);
 
-            // Convert screen coordinates to Progman client coordinates
             POINT Point = { MonRect.left, MonRect.top };
             MapWindowPoints(nullptr, DesktopWnds.Progman, &Point, 1);
 
@@ -707,12 +657,10 @@ static bool CreateMonitorWallpapers(const FDesktopWindows& DesktopWnds)
             else
                 SetWindowPos(MonWallpaper.Window, HWND_BOTTOM, Point.x, Point.y, Width, Height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
-            // Next monitor window goes after this one in Z-order
             InsertAfter = MonWallpaper.Window;
         }
         else
         {
-            // Legacy: child of WorkerW — also need client coord conversion
             HWND Host = DesktopWnds.WorkerW ? DesktopWnds.WorkerW : DesktopWnds.Progman;
 
             POINT Point = { MonRect.left, MonRect.top };
@@ -733,7 +681,6 @@ static bool CreateMonitorWallpapers(const FDesktopWindows& DesktopWnds)
             + std::to_wstring(Width) + L"x" + std::to_wstring(Height));
     }
 
-    // Hide static wallpaper
     if (DesktopWnds.bShellOnProgman && DesktopWnds.WorkerW)
     {
         ShowWindow(DesktopWnds.WorkerW, SW_HIDE);
@@ -743,9 +690,6 @@ static bool CreateMonitorWallpapers(const FDesktopWindows& DesktopWnds)
     return !GMonitors.empty();
 }
 
-// ---------------------------------------------------------------------------
-// Create MFPlay player for each monitor window
-// ---------------------------------------------------------------------------
 static bool CreatePlayers()
 {
     for (size_t Index = 0; Index < GMonitors.size(); ++Index)
@@ -764,7 +708,6 @@ static bool CreatePlayers()
             return false;
         }
 
-        // Strip audio — wallpapers don't need sound, saves decoding overhead
         Monitor.Player->SetMute(GbMuted ? TRUE : FALSE);
 
         ShowWindow(Monitor.Window, SW_SHOW);
@@ -774,9 +717,6 @@ static bool CreatePlayers()
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Autostart helpers
-// ---------------------------------------------------------------------------
 static const wchar_t* GAutoRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* GAutoRunValue = L"VideoWallpaper";
 
@@ -810,9 +750,6 @@ static void SetAutoStart(bool bEnable)
     RegCloseKey(Key);
 }
 
-// ---------------------------------------------------------------------------
-// Change video (hot-reload)
-// ---------------------------------------------------------------------------
 static void ChangeVideo()
 {
     wchar_t FilePath[MAX_PATH] = {};
@@ -827,13 +764,11 @@ static void ChangeVideo()
 
     if (!GetOpenFileNameW(&OpenFileName)) return;
 
-    // Write to config.txt
     std::wstring ConfigPath = GetExeDir() + L"\\config.txt";
     std::wofstream ConfigFile(ConfigPath.c_str());
     ConfigFile << FilePath;
     ConfigFile.close();
 
-    // Hot-reload
     GVideoPath = FilePath;
     ShutdownAllMonitors();
     Log(L"Reloading video: " + GVideoPath);
@@ -858,14 +793,10 @@ static void ChangeVideo()
     GbAutoPausedByFullscreen = false;
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
 {
     GInstance = Instance;
 
-    // --- Single instance guard ---
     GMutex = CreateMutexW(nullptr, TRUE, L"Global\\VideoWallpaperMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
@@ -873,11 +804,9 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
         return 0;
     }
 
-    // --- Init debug logging ---
     GbDebugEnabled = IsDebugFlagPresent();
     if (GbDebugEnabled) Log(L"Debug logging enabled.");
 
-    // --- Read and validate config ---
     GVideoPath = ReadVideoPath();
     if (GVideoPath.empty())
     {
@@ -893,11 +822,9 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
     }
     Log(L"Video path: " + GVideoPath);
 
-    // --- COM & Media Foundation ---
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     if (FAILED(MFStartup(MF_VERSION))) { CoUninitialize(); return 1; }
 
-    // --- Register window classes ---
     WNDCLASSW WallpaperWndClass{};
     WallpaperWndClass.lpfnWndProc   = WallpaperWndProc;
     WallpaperWndClass.hInstance      = Instance;
@@ -912,7 +839,6 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
     MsgWndClass.lpszClassName  = MsgClassName;
     RegisterClassW(&MsgWndClass);
 
-    // --- Find desktop windows (retry for up to 30s at boot) ---
     for (int32_t Attempt = 0; Attempt < MaxDesktopRetries; ++Attempt)
     {
         GDesktop = FindDesktopWindows();
@@ -927,14 +853,12 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
         return 1;
     }
 
-    // --- Show host for legacy mode ---
     if (!GDesktop.bShellOnProgman)
     {
         HWND Host = GDesktop.WorkerW ? GDesktop.WorkerW : GDesktop.Progman;
         ShowWindow(Host, SW_SHOWNA);
     }
 
-    // --- Create per-monitor wallpaper windows ---
     if (!CreateMonitorWallpapers(GDesktop))
     {
         MessageBoxW(nullptr, L"Failed to create wallpaper windows.", L"VideoWallpaper", MB_ICONERROR);
@@ -942,7 +866,6 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
         return 1;
     }
 
-    // --- Create a player per monitor ---
     if (!CreatePlayers())
     {
         std::wstring ErrorMsg = L"Failed to create media player.\n\nFile: " + GVideoPath;
@@ -952,11 +875,9 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
         return 1;
     }
 
-    // --- Trim working set: reclaim cached pages from MF/COM init ---
     EmptyWorkingSet(GetCurrentProcess());
     Log(L"Working set trimmed after player init.");
 
-    // --- Hidden message window for hotkey & display change ---
     GMsgWindow = CreateWindowExW(
         0, MsgClassName, L"", 0,
         0, 0, 0, 0,
@@ -970,7 +891,6 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, PWSTR, int)
         return 1;
     }
 
-    // --- Message loop ---
     MSG Msg;
     while (GetMessageW(&Msg, nullptr, 0, 0) > 0)
     {
