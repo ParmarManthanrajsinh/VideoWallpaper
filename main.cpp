@@ -341,41 +341,101 @@ namespace
 // ---------------------------------------------------------------------------
 // Fullscreen / maximized detection
 // ---------------------------------------------------------------------------
-static bool IsDesktopOccluded()
+
+/** Dynamically checks if DWM is currently cloaking the window. */
+static bool IsWindowCloaked(HWND Hwnd)
 {
-    HWND ForegroundWnd = GetForegroundWindow();
-    if (!ForegroundWnd) return false;
+    typedef HRESULT (WINAPI *DwmGetWindowAttribute_t)(HWND, DWORD, PVOID, DWORD);
+    static HMODULE DwmApi = LoadLibraryW(L"dwmapi.dll");
+    static DwmGetWindowAttribute_t DwmGetWindowAttributeFn = 
+        DwmApi ? reinterpret_cast<DwmGetWindowAttribute_t>(GetProcAddress(DwmApi, "DwmGetWindowAttribute")) : nullptr;
 
-    // Don't pause for desktop / shell windows
-    wchar_t ClassName[ClassNameBufferSize] = {};
-    GetClassNameW(ForegroundWnd, ClassName, ClassNameBufferSize);
-    if (lstrcmpW(ClassName, L"Progman") == 0 ||
-        lstrcmpW(ClassName, L"WorkerW") == 0 ||
-        lstrcmpW(ClassName, L"Shell_TrayWnd") == 0 ||
-        lstrcmpW(ClassName, L"Shell_SecondaryTrayWnd") == 0)
-        return false;
+    if (DwmGetWindowAttributeFn)
+    {
+        int32_t Cloaked = 0;
+        // DWMWA_CLOAKED = 14
+        if (SUCCEEDED(DwmGetWindowAttributeFn(Hwnd, 14, &Cloaked, sizeof(Cloaked))))
+        {
+            return Cloaked != 0;
+        }
+    }
+    return false;
+}
 
-    RECT ForegroundRect;
-    GetWindowRect(ForegroundWnd, &ForegroundRect);
-
+/** Returns true if a single window covers at least one full monitor. */
+static bool IsWindowCoveringMonitor(HWND Hwnd)
+{
     // Maximized window covers the full work area
-    if (IsZoomed(ForegroundWnd))
+    if (IsZoomed(Hwnd))
         return true;
 
     // Check for borderless fullscreen (games, video players)
-    LONG_PTR Style = GetWindowLongPtrW(ForegroundWnd, GWL_STYLE);
+    LONG_PTR Style = GetWindowLongPtrW(Hwnd, GWL_STYLE);
     bool bNoBorder = !(Style & WS_CAPTION) || !(Style & WS_THICKFRAME);
     if (!bNoBorder) return false;
 
-    // Check if it covers at least one monitor fully
-    HMONITOR Monitor = MonitorFromWindow(ForegroundWnd, MONITOR_DEFAULTTONEAREST);
+    RECT WindowRect;
+    GetWindowRect(Hwnd, &WindowRect);
+
+    HMONITOR Monitor = MonitorFromWindow(Hwnd, MONITOR_DEFAULTTONEAREST);
     MONITORINFO MonitorInfo = { sizeof(MonitorInfo) };
     GetMonitorInfoW(Monitor, &MonitorInfo);
 
-    return (ForegroundRect.left   <= MonitorInfo.rcMonitor.left &&
-            ForegroundRect.top    <= MonitorInfo.rcMonitor.top &&
-            ForegroundRect.right  >= MonitorInfo.rcMonitor.right &&
-            ForegroundRect.bottom >= MonitorInfo.rcMonitor.bottom);
+    return (WindowRect.left   <= MonitorInfo.rcMonitor.left &&
+            WindowRect.top    <= MonitorInfo.rcMonitor.top &&
+            WindowRect.right  >= MonitorInfo.rcMonitor.right &&
+            WindowRect.bottom >= MonitorInfo.rcMonitor.bottom);
+}
+
+/** Returns true if a window class belongs to the desktop shell. */
+static bool IsShellWindow(HWND Hwnd)
+{
+    wchar_t ClassName[ClassNameBufferSize] = {};
+    GetClassNameW(Hwnd, ClassName, ClassNameBufferSize);
+    return (lstrcmpW(ClassName, L"Progman") == 0 ||
+            lstrcmpW(ClassName, L"WorkerW") == 0 ||
+            lstrcmpW(ClassName, L"Shell_TrayWnd") == 0 ||
+            lstrcmpW(ClassName, L"Shell_SecondaryTrayWnd") == 0);
+}
+
+/** EnumWindows callback — sets bOccluded to true if any window covers the desktop. */
+static BOOL CALLBACK OcclusionEnumProc(HWND Hwnd, LPARAM LParam)
+{
+    bool* bOutOccluded = reinterpret_cast<bool*>(LParam);
+
+    // Skip invisible, minimized, shell, and our own wallpaper windows
+    if (!IsWindowVisible(Hwnd)) return TRUE;
+    if (IsIconic(Hwnd)) return TRUE;  // Minimized windows don't cover the desktop
+
+    // Skip tool windows (e.g. invisible NVIDIA GeForce Overlay, tooltips)
+    LONG_PTR ExStyle = GetWindowLongPtrW(Hwnd, GWL_EXSTYLE);
+    if (ExStyle & WS_EX_TOOLWINDOW) return TRUE;
+
+    // Skip DWM Cloaked windows (invisible UWP background apps)
+    if (IsWindowCloaked(Hwnd)) return TRUE;
+
+    if (IsShellWindow(Hwnd)) return TRUE;
+
+    // Skip our own wallpaper windows
+    for (const auto& Monitor : GMonitors)
+    {
+        if (Monitor.Window == Hwnd) return TRUE;
+    }
+
+    if (IsWindowCoveringMonitor(Hwnd))
+    {
+        *bOutOccluded = true;
+        return FALSE;  // Stop enumeration early
+    }
+    return TRUE;
+}
+
+/** Checks whether ANY visible top-level window fully covers a monitor. */
+static bool IsDesktopOccluded()
+{
+    bool bOccluded = false;
+    EnumWindows(OcclusionEnumProc, reinterpret_cast<LPARAM>(&bOccluded));
+    return bOccluded;
 }
 
 // ---------------------------------------------------------------------------
