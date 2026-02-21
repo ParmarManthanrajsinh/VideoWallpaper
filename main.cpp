@@ -48,6 +48,7 @@ namespace
     std::ofstream g_logFile;
     std::wstring g_videoPath;
     bool g_paused = false;
+    bool g_autoPausedByFullscreen = false;
     bool g_muted = true;
     HINSTANCE g_inst = nullptr;
     const wchar_t* g_wpClass = L"VideoWallpaperClass";
@@ -296,6 +297,46 @@ namespace
 }
 
 // ---------------------------------------------------------------------------
+// Fullscreen / maximized detection
+// ---------------------------------------------------------------------------
+static bool IsDesktopOccluded()
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+
+    // Don't pause for desktop / shell windows
+    wchar_t cls[64] = {};
+    GetClassNameW(fg, cls, 64);
+    if (lstrcmpW(cls, L"Progman") == 0 ||
+        lstrcmpW(cls, L"WorkerW") == 0 ||
+        lstrcmpW(cls, L"Shell_TrayWnd") == 0 ||
+        lstrcmpW(cls, L"Shell_SecondaryTrayWnd") == 0)
+        return false;
+
+    RECT fgRect;
+    GetWindowRect(fg, &fgRect);
+
+    // Maximized window covers the full work area
+    if (IsZoomed(fg))
+        return true;
+
+    // Check for borderless fullscreen (games, video players)
+    LONG style = GetWindowLongW(fg, GWL_STYLE);
+    bool noBorder = !(style & WS_CAPTION) || !(style & WS_THICKFRAME);
+    if (!noBorder) return false;
+
+    // Check if it covers at least one monitor fully
+    HMONITOR hMon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(hMon, &mi);
+
+    return (fgRect.left   <= mi.rcMonitor.left &&
+            fgRect.top    <= mi.rcMonitor.top &&
+            fgRect.right  >= mi.rcMonitor.right &&
+            fgRect.bottom >= mi.rcMonitor.bottom);
+}
+
+// ---------------------------------------------------------------------------
 // Wallpaper window procedure (per-monitor windows)
 // ---------------------------------------------------------------------------
 LRESULT CALLBACK WpWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -403,6 +444,7 @@ LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         case ID_TRAY_PAUSE:
             g_paused = !g_paused;
+            g_autoPausedByFullscreen = false;  // Manual override clears auto-pause
             for (auto& m : g_monitors)
                 if (m.player) { g_paused ? m.player->Pause() : m.player->Play(); }
             break;
@@ -441,9 +483,30 @@ LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == 100)
         {
+            // --- Fullscreen auto-pause ---
+            if (!g_paused)  // Don't interfere with manual pause
+            {
+                bool occluded = IsDesktopOccluded();
+                if (occluded && !g_autoPausedByFullscreen)
+                {
+                    g_autoPausedByFullscreen = true;
+                    for (auto& m : g_monitors)
+                        if (m.player) m.player->Pause();
+                    Log(L"Auto-paused: foreground window covers desktop.");
+                }
+                else if (!occluded && g_autoPausedByFullscreen)
+                {
+                    g_autoPausedByFullscreen = false;
+                    for (auto& m : g_monitors)
+                        if (m.player) m.player->Play();
+                    Log(L"Auto-resumed: desktop visible.");
+                }
+            }
+
+            // --- Pre-seek loop ---
             for (auto& m : g_monitors)
             {
-                if (!m.player || m.duration <= 0 || g_paused) continue;
+                if (!m.player || m.duration <= 0 || g_paused || g_autoPausedByFullscreen) continue;
                 PROPVARIANT pos; PropVariantInit(&pos);
                 if (SUCCEEDED(m.player->GetPosition(MFP_POSITIONTYPE_100NS, &pos)))
                 {
