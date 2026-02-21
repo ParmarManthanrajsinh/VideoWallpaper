@@ -166,26 +166,23 @@ namespace
         return TrimString(Path);
     }
 
-    struct FLegacySearch
-    {
-        HWND WorkerWithShell = nullptr;
-        HWND WorkerWithout = nullptr;
-    };
-
+    // Finds the WorkerW that CONTAINS SHELLDLL_DefView (the icons container).
+    // We then ask for its NEXT SIBLING WorkerW — that's the blank wallpaper host.
+    // This is the canonical technique used by Wallpaper Engine and Lively Wallpaper.
     BOOL CALLBACK LegacyEnumProc(HWND Hwnd, LPARAM LParam)
     {
-        auto* Search = reinterpret_cast<FLegacySearch*>(LParam);
-        wchar_t ClassName[ClassNameBufferSize] = {};
-        GetClassNameW(Hwnd, ClassName, ClassNameBufferSize);
-        if (lstrcmpW(ClassName, L"WorkerW") != 0) return TRUE;
+        // Does this top-level window have SHELLDLL_DefView as a direct child?
         HWND ShellView = FindWindowExW(Hwnd, nullptr, L"SHELLDLL_DefView", nullptr);
+        if (!ShellView) return TRUE;
 
-        if (ShellView) 
-            Search->WorkerWithShell = Hwnd;
-        else if (!Search->WorkerWithout) 
-            Search->WorkerWithout = Hwnd;
+        // Found it. Now get the next sibling WorkerW — that's the blank host.
+        // FindWindowEx(NULL, hwnd, class, name) = find a top-level window with
+        // that class that comes AFTER hwnd in Z-order.
+        HWND* pResult = reinterpret_cast<HWND*>(LParam);
+        *pResult = FindWindowExW(nullptr, Hwnd, L"WorkerW", nullptr);
 
-        return TRUE;
+        // Stop enumeration — we found what we need
+        return FALSE;
     }
 
     struct FProgmanChildren
@@ -259,26 +256,34 @@ namespace
         Log(L"Legacy WorkerW mode.");
         for (int32_t Attempt = 0; Attempt < 50; ++Attempt)
         {
-            FLegacySearch LegacySearch;
-            EnumWindows(LegacyEnumProc, reinterpret_cast<LPARAM>(&LegacySearch));
-            if (LegacySearch.WorkerWithShell && LegacySearch.WorkerWithout)
+            HWND WallpaperWorkerW = nullptr;
+            EnumWindows(LegacyEnumProc, reinterpret_cast<LPARAM>(&WallpaperWorkerW));
+
+            if (WallpaperWorkerW)
             {
-                DesktopWnds.WorkerW = LegacySearch.WorkerWithout;
-                DesktopWnds.ShellDefView = FindWindowExW
-                (
-                    LegacySearch.WorkerWithShell,
-                    nullptr,
-                    L"SHELLDLL_DefView",
-                    nullptr
-                );
+                DesktopWnds.WorkerW = WallpaperWorkerW;
+                // ShellDefView is found inside the OTHER WorkerW (the one with icons)
+                // We need it for Z-ordering; find it by enumerating all top-level WorkerWs
+                EnumWindows([](HWND H, LPARAM LP) -> BOOL {
+                    HWND SDV = FindWindowExW(H, nullptr, L"SHELLDLL_DefView", nullptr);
+                    if (SDV) {
+                        *reinterpret_cast<HWND*>(LP) = SDV;
+                        return FALSE;
+                    }
+                    return TRUE;
+                }, reinterpret_cast<LPARAM>(&DesktopWnds.ShellDefView));
+
+                Log(L"Win10 WorkerW found. WorkerW=" + std::to_wstring(
+                    reinterpret_cast<uintptr_t>(WallpaperWorkerW)));
                 return DesktopWnds;
             }
-            // Re-send the trigger each attempt — Explorer sometimes needs multiple nudges
+
+            // Re-send the spawn trigger — Explorer may need multiple nudges
             SendMessageTimeoutW(DesktopWnds.Progman, WM_SPAWN_WORKERW, 0, 0,
-                               SMTO_BLOCK | SMTO_NORMAL, 500, &Result);
+                                SMTO_NORMAL, 500, &Result);
             Sleep(100);
         }
-        Log(L"Legacy mode: timeout.");
+        Log(L"Legacy mode: timeout, blank WorkerW was never created.");
         return DesktopWnds;
     }
 
