@@ -1,0 +1,15 @@
+# Build artifacts
+*.exe
+*.o
+*.obj
+*.res
+
+# Debug files
+debug.log
+debug.flag
+
+# IDE / Editor
+.vs/
+.vscode/
+*.swp
+*~
